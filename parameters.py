@@ -9,8 +9,8 @@ from pcode.utils.param_parser import str2bool
 
 def get_args():
     ROOT_DIRECTORY = "./"
-    RAW_DATA_DIRECTORY = join(ROOT_DIRECTORY, "data/")
-    TRAINING_DIRECTORY = join(RAW_DATA_DIRECTORY, "checkpoint")
+    RAW_DATA_DIRECTORY = join(ROOT_DIRECTORY, "data/")  # 原始数据集根目录 。/data/
+    TRAINING_DIRECTORY = join(RAW_DATA_DIRECTORY, "checkpoint") # 训练数据 划分后的目录 ./data/checkpoint
 
     model_names = sorted(
         name for name in models.__dict__ if name.islower() and not name.startswith("__")
@@ -26,11 +26,14 @@ def get_args():
     parser.add_argument("--remote_exec", default=False, type=str2bool)
 
     # dataset.
+    # 数据集默认是cifar10
     parser.add_argument("--data", default="cifar10", help="a specific dataset name")
+    # 验证集所占比例 训练集所站比例
     parser.add_argument("--val_data_ratio", type=float, default=0)
     parser.add_argument(
         "--train_data_ratio", type=float, default=0, help="after the train/val split."
     )
+    # 数据集默认存放位置 ./data
     parser.add_argument(
         "--data_dir", default=RAW_DATA_DIRECTORY, help="path to dataset"
     )
@@ -42,6 +45,7 @@ def get_args():
         type=str2bool,
         help="use sequential lmdb dataset for better loading.",
     )
+    # 数据划分方式（用于联邦学习中客户端数据分配）
     parser.add_argument(
         "--partition_data",
         default=None,
@@ -60,13 +64,15 @@ def get_args():
         "--pn_normalize", default=True, type=str2bool, help="normalize by mean/std."
     )
 
-    # model
+    # model 
+    # 模型架构（默认 resnet20，支持多种模型，由 pcode.models 定义）
     parser.add_argument(
         "--arch",
         default="resnet20",
         help="model architecture: " + " | ".join(model_names) + " (default: resnet20)",
     )
     parser.add_argument("--group_norm_num_groups", default=None, type=int)
+    # --complex_arch：复杂架构配置（如主从模型不同架构，格式如 master=resnet20,worker=resnet8:resnet14）
     parser.add_argument(
         "--complex_arch", type=str, default="master=resnet20,worker=resnet8:resnet14"
     )
