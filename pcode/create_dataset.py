@@ -39,18 +39,18 @@ def load_data_batch(conf, _input, _target, is_training=True,device="cuda"):
     return _data_batch
 
 
-def define_dataset(conf, data, display_log=True,agg_data_ratio = 0.0):
+def define_dataset(conf, data, display_log=True,agg_data_ratio = 0.0): # agg_data_ratio聚合数据比例
     # prepare general train/test.
     conf.partitioned_by_user = True if "femnist" == conf.data else False
-    train_dataset = get_dataset(conf, data, conf.data_dir, split="train")
-    test_dataset = get_dataset(conf, data, conf.data_dir, split="test")
-
+    train_dataset = get_dataset(conf, data, conf.data_dir, split="train") # 获取训练集
+    test_dataset = get_dataset(conf, data, conf.data_dir, split="test") # 获取测试集
+# 此时还未划分，所有客户端数据集都几种在此处
     # create the validation from train.
-    if agg_data_ratio == 0:
+    if agg_data_ratio == 0: # 这里也通常为0，因为服务器通常没有数据
         train_dataset, val_dataset, test_dataset = define_val_dataset(
             conf, train_dataset, test_dataset
-        )
-        if conf.val_dataset:
+        )# 划分数据集，将一部分训练集划分为验证集 define_val_dataset里面是origin，索引未打乱
+        if conf.val_dataset: # 这个关键字表明是否有单独的验证数据集,这里通常为false
             val_dataset = get_dataset(conf, data, conf.data_dir, split="valid")
 
         if display_log:
@@ -114,12 +114,12 @@ def split_train_dataset(conf, train_dataset, agg_data_ratio=0.0, return_val=Fals
 def define_val_dataset(conf, train_dataset, test_dataset):
     assert conf.val_data_ratio >= 0
 
-    partition_sizes = [
+    partition_sizes = [     # 分成三部分，训练集，丢弃部分，验证集
         (1 - conf.val_data_ratio) * conf.train_data_ratio,
         (1 - conf.val_data_ratio) * (1 - conf.train_data_ratio),
         conf.val_data_ratio,
     ]
-    patition_type = "origin"
+    patition_type = "origin" # 这里可以填random打乱索引随机切，填sort则会分类排序，同一类放在一起
     if "tiny" in conf.data:
         patition_type = "random"
     data_partitioner = DataPartitioner(
@@ -148,7 +148,7 @@ def define_data_loader(
     # either the whole dataset, or a subset specified by partition_type.
     if is_train:
         world_size = conf.n_clients
-        partition_sizes = [1.0 / world_size for _ in range(world_size)]
+        partition_sizes = [1.0 / world_size for _ in range(world_size)] # 划分每个客户端的数据集，均为 1/n_clients ,不是狄利克雷划分？
         assert localdata_id is not None
 
         if conf.partitioned_by_user:  # partitioned by "users".
@@ -160,13 +160,13 @@ def define_data_loader(
             # in case we have a global dataset and want to manually partition them.
             if data_partitioner is None:
                 # update the data_partitioner.
-                data_partitioner = DataPartitioner(
+                data_partitioner = DataPartitioner( # 这里传入每个客户端的
                     conf, dataset, partition_sizes, partition_type=conf.partition_data
-                )
+                ) # 按照命令行传参划分数据
             # note that the master node will not consume the training dataset.
             data_to_load = data_partitioner.use(localdata_id)
 
-            conf.n_minibatch = int(len(data_to_load) / conf.batch_size * conf.local_n_epochs)
+            conf.n_minibatch = int(len(data_to_load) / conf.batch_size * conf.local_n_epochs) # 计算总的迭代次数 轮数*每一轮迭代次数
         conf.logger.log(
             f"Data partition for train (client_id={localdata_id + 1}): partitioned data and use subdata."
         )
@@ -180,7 +180,7 @@ def define_data_loader(
             data_to_load = dataset
         conf.logger.log("Data partition for validation/test.")
 
-    if conf.batch_padding:
+    if conf.batch_padding: # 主要用于nlp的变长序列补丁
         from pcode.datasets.loader.entity_datasets import pad
         padding = pad
     else:
@@ -191,10 +191,10 @@ def define_data_loader(
         batch_size=conf.batch_size,
         shuffle=shuffle,
         num_workers=conf.num_workers,
-        pin_memory=conf.pin_memory,
+        pin_memory=conf.pin_memory,         # 内存优化
         drop_last=False,
         collate_fn = padding,
-        multiprocessing_context='fork'
+        multiprocessing_context='fork'       # 启动子进程方式
     )
 
     # Some simple statistics.
@@ -207,8 +207,8 @@ def define_data_loader(
             conf.batch_size,
         )
     )
-    conf.num_batches_per_device_per_epoch = len(data_loader)
+    conf.num_batches_per_device_per_epoch = len(data_loader)    
     conf.num_whole_batches_per_worker = (
-        conf.num_batches_per_device_per_epoch * conf.local_n_epochs
+        conf.num_batches_per_device_per_epoch * conf.local_n_epochs    # 计算总的迭代次数
     )
     return data_loader, data_partitioner

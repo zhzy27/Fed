@@ -364,5 +364,6 @@ RUNCONFIGS = {
 
 }
 
-generative_model = Generator("cifar10")
-print(sum(p.numel() for p in generative_model.parameters()) / 1e6,)
+# generative_model = Generator("cifar10")
+# print(sum(p.numel() for p in generative_model.parameters()) / 1e6,)
+# 多余信息吧

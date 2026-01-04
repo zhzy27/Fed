@@ -52,7 +52,7 @@ def get_args():
         type=str,
         help="decide if each worker will access to all data.",
     )
-    parser.add_argument("--pin_memory", default=True, type=str2bool)
+    parser.add_argument("--pin_memory", default=True, type=str2bool)    # 内存优化
     parser.add_argument(
         "-j",
         "--num_workers",
@@ -93,7 +93,7 @@ def get_args():
     parser.add_argument("--local_n_epochs", type=float, default=1)
     parser.add_argument("--random_reinit_local_model", default=None, type=str)
     parser.add_argument("--local_prox_term", type=float, default=0.1)
-    parser.add_argument("--min_local_epochs", type=float, default=None)
+    parser.add_argument("--min_local_epochs", type=float, default=None)     # 最低本地轮次
     parser.add_argument("--reshuffle_per_epoch", default=False, type=str2bool)
     parser.add_argument(
         "--batch_size",
@@ -183,9 +183,9 @@ def get_args():
     # configuration for different models.
 
     parser.add_argument("--max_seq_len", type=int, default=128)
-    parser.add_argument("--agg_data_ratio", type=float,default=0)
+    parser.add_argument("--agg_data_ratio", type=float,default=0) # 服务器拥有数据比例
 
-    parser.add_argument("--batch_padding", type = int, default=0)
+    parser.add_argument("--batch_padding", type = int, default=0) # 主要用于nlp的变长序列补丁
     parser.add_argument("--val_dataset", type=int, default=0)
     parser.add_argument("--ensemble", default=False,type=str2bool)
 

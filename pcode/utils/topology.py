@@ -18,8 +18,8 @@ def configure_gpu(world_conf):
 
 class PhysicalLayout(object):
     def __init__(self, n_participated, world, world_conf, on_cuda):
-        self.n_participated = n_participated
-        self._world = self.configure_world(world, world_conf)
+        self.n_participated = n_participated 
+        self._world = self.configure_world(world, world_conf) 
         self._on_cuda = on_cuda
         self.rank = -1
 
@@ -65,7 +65,7 @@ class PhysicalLayout(object):
         self.n_participated = n_participated
 
 
-def define_graph_topology(world, world_conf, n_participated, on_cuda):
+def define_graph_topology(world, world_conf, n_participated, on_cuda): # world参数为指定哪个进程使用哪个GPU，这里并未指定，world_conf为指定GPU序列，这里为'0,0,1,1,100'分别为start，stop，intrval，count，即100个0
     return PhysicalLayout(
         n_participated=n_participated,
         world=world,

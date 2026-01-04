@@ -14,7 +14,7 @@ def define_model(
 ):
     arch, model = define_cv_classification_model(
         conf, client_id, use_complex_arch, arch
-    )
+    ) # 获取模型
 
     # consistent the model.
     if to_consistent_model:
@@ -22,7 +22,7 @@ def define_model(
 
     # get the model stat info.
     if show_stat:
-        get_model_stat(conf, model, arch)
+        get_model_stat(conf, model, arch) # 打印模型信息
     return arch, model
 
 
@@ -53,7 +53,7 @@ def determine_arch(conf, client_id, use_complex_arch):
 
 def define_cv_classification_model(conf, client_id, use_complex_arch, arch):
     # determine the arch.
-    arch = determine_arch(conf, client_id, use_complex_arch) if arch is None else arch
+    arch = determine_arch(conf, client_id, use_complex_arch) if arch is None else arch  # 获取模型名称
     # use the determined arch to init the model.
     if "wideresnet" in arch:
         model = models.__dict__["wideresnet"](conf)

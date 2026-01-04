@@ -198,7 +198,7 @@ class ResNetBase(nn.Module):
             )
 
         layers = []
-        layers.append(
+        layers.append( #  block_fn 为两个3*3的卷积层的block块
             block_fn(
                 in_planes=self.inplanes,
                 out_planes=planes,
@@ -376,9 +376,9 @@ class CifarResNet(ResNetBase):
         super(CifarResNet, self).__init__()
 
         self.dataset = dataset
-        self.freeze_bn = freeze_bn
+        self.freeze_bn = freeze_bn # 停止统计全局均值和方差：BN 层将不再维护和更新全局的 running_mean（滑动平均均值）和 running_var（滑动平均方差）。
         self.freeze_bn_affine = freeze_bn_affine
-        track_running_stats = not self.freeze_bn
+        track_running_stats = not self.freeze_bn # bn层的仿射变换是否有效
 
         # define model.
         if resnet_size % 6 != 2:
@@ -391,7 +391,7 @@ class CifarResNet(ResNetBase):
 
         # define layers.
         assert int(16 * scaling) > 0
-        self.inplanes = int(16 * scaling)
+        self.inplanes = int(16 * scaling) # 第一个残差块的输入通道
         self.conv1 = nn.Conv2d(
             in_channels=3,
             out_channels=(16 * scaling),
@@ -399,11 +399,11 @@ class CifarResNet(ResNetBase):
             stride=1,
             padding=1,
             bias=False,
-        )
-        self.bn1 = norm2d(group_norm_num_groups, planes=int(16 * scaling),track_running_stats=track_running_stats)
+        ) # 初始层
+        self.bn1 = norm2d(group_norm_num_groups, planes=int(16 * scaling),track_running_stats=track_running_stats) # 组归一化
         self.relu = nn.ReLU(inplace=True)
 
-        self.layer1 = self._make_block(
+        self.layer1 = self._make_block( # 构建block_nums个残差块，每个块两层卷积
             block_fn=block_fn,
             planes=int(16 * scaling),
             block_num=block_nums,
@@ -430,7 +430,7 @@ class CifarResNet(ResNetBase):
         self.avgpool = nn.AvgPool2d(kernel_size=8)
         feature_dim = int(64 * scaling * block_fn.expansion)
         self.projection = projection
-        if self.projection:
+        if self.projection: # 通常用于特征对齐，提升性能
 
             self.projection_layer = nn.Sequential(
                 nn.Linear(feature_dim,feature_dim),
@@ -475,7 +475,7 @@ class CifarResNet(ResNetBase):
 
 def resnet(conf, arch=None):
 
-    resnet_size = int((arch if arch is not None else conf.arch).replace("resnet", ""))
+    resnet_size = int((arch if arch is not None else conf.arch).replace("resnet", "")) # 层数
     dataset = conf.data
     save_activations = True if conf.AT_beta > 0 else False
 

@@ -26,10 +26,10 @@ class Master(object):
         self.world_ids = list(range(1, 1 + conf.n_participated))
 
         # create model as well as their corresponding state_dicts.
-        _, self.master_model = create_model.define_model(
+        _, self.master_model = create_model.define_model( # 获取模型
             conf, to_consistent_model=False
         )
-        self.used_client_archs = set(
+        self.used_client_archs = set( # set去重，打印所有客户端架构
             [
                 create_model.determine_arch(conf, client_id, use_complex_arch=True)
                 for client_id in range(1, 1 + conf.n_clients)
@@ -40,12 +40,12 @@ class Master(object):
         conf.logger.log(f"The client will use archs={self.used_client_archs}.")
         conf.logger.log("Master created model templates for client models.")
 
-        self.client_models = dict(
+        self.client_models = dict( # 获取客户端模型信息
             create_model.define_model(conf, to_consistent_model=False, arch=arch)
             for arch in self.used_client_archs
         )
 
-        self.clientid2arch = dict(
+        self.clientid2arch = dict( # 获取所有客户端的模型名称
             (
                 client_id,
                 create_model.determine_arch(
@@ -69,7 +69,10 @@ class Master(object):
             localdata_id=0,  # random id here.
             is_train=True,
             data_partitioner=None,
-        )
+        ) # 虽然划分了数据但是全丢了，只保留数据划分器
+
+
+
         conf.logger.log(f"Master initialized the local training data with workers.")
 
         # create val loader.
@@ -100,14 +103,14 @@ class Master(object):
             test_loader, _ = create_dataset.define_data_loader(
                 conf, self.dataset["test"], is_train=False
             )
-            self.test_loaders = [test_loader]
+            self.test_loaders = [test_loader] # 这里的test_loader和上面的val_loader都是总的，也就是说未平分给客户端的
 
         # define the criterion and metrics.
-        self.criterion = cross_entropy.CrossEntropyLoss(reduction="mean")
-        self.metrics = create_metrics.Metrics(self.master_model, task="classification")
+        self.criterion = cross_entropy.CrossEntropyLoss(reduction="mean")   # 模型的损失函数，这里传入mean表示计算的损失会求平均
+        self.metrics = create_metrics.Metrics(self.master_model, task="classification")  # 模型的评估，计算准确率之类
         conf.logger.log(f"Master initialized model/dataset/criterion/metrics.")
 
-        self.coordinator = create_coordinator.Coordinator(conf, self.metrics)
+        self.coordinator = create_coordinator.Coordinator(conf, self.metrics)   # 记录最佳性能
         if not self.conf.train_fast:
             self.local_coordinator = [create_coordinator.Coordinator(conf, self.metrics) for _ in
                                       range(self.conf.n_clients)]
@@ -117,11 +120,11 @@ class Master(object):
         # define early_stopping_tracker.
         self.early_stopping_tracker = EarlyStoppingTracker(
             patience=conf.early_stopping_rounds
-        )
+        )   # 早停装置，为0时关掉早停功能
 
         # save arguments to disk.
-        conf.is_finished = False
-        checkpoint.save_arguments(conf)
+        conf.is_finished = False    # 用于控制全局训练是否已经结束
+        checkpoint.save_arguments(conf) # 将超参数保存在json文件中
 
     def run(self):
         for comm_round in range(1, 1 + self.conf.n_comm_rounds):
@@ -133,14 +136,14 @@ class Master(object):
             # get random n_local_epochs.
             list_of_local_n_epochs = get_n_local_epoch(
                 conf=self.conf, n_participated=self.conf.n_participated
-            )
+            )   # 生成参与数长的列表，每个值为每个客户端的训练轮数
             self.list_of_local_n_epochs = list_of_local_n_epochs
 
             # random select clients from a pool.
-            selected_client_ids = self._random_select_clients()
+            selected_client_ids = self._random_select_clients() # 随机选择客户端
 
             # detect early stopping.
-            self._check_early_stopping()
+            self._check_early_stopping() # 检查是否满足早停，可能未开启早停
 
             # init the activation tensor and broadcast to all clients (either start or stop).
             self.activate_selected_clients(
@@ -185,7 +188,7 @@ class Master(object):
     def _random_select_clients(self):
         selected_client_ids = self.conf.random_state.choice(
             self.client_ids, self.conf.n_participated, replace=False
-        ).tolist()
+        ).tolist()  # 随机选择客户端
         selected_client_ids.sort()
         self.conf.logger.log(
             f"Master selected {self.conf.n_participated} from {self.conf.n_clients} clients: {selected_client_ids}."
@@ -200,12 +203,12 @@ class Master(object):
         # the second row indicates the current_comm_round,
         # the third row indicates the expected local_n_epochs
         selected_client_ids = np.array(selected_client_ids)
-        msg_len = 3
+        msg_len = 3 # 消息行数
 
         activation_msg = torch.zeros((msg_len, len(selected_client_ids)))
-        activation_msg[0, :] = torch.Tensor(selected_client_ids)
-        activation_msg[1, :] = comm_round
-        activation_msg[2, :] = torch.Tensor(list_of_local_n_epochs)
+        activation_msg[0, :] = torch.Tensor(selected_client_ids) # 第一行装客户端id
+        activation_msg[1, :] = comm_round                       # 第二行装联邦轮次
+        activation_msg[2, :] = torch.Tensor(list_of_local_n_epochs)     # 第三行装每个客户端训练轮数
 
         dist.broadcast(tensor=activation_msg, src=0)
         self.conf.logger.log(f"Master activated the selected clients.")
@@ -216,11 +219,11 @@ class Master(object):
         self.conf.logger.log(f"Master send the models to workers.")
 
         for worker_rank, selected_client_id in enumerate(selected_client_ids, start=1):
-            arch = self.clientid2arch[selected_client_id]
+            arch = self.clientid2arch[selected_client_id] # 获取当前循环模型名称
             client_model_state_dict = self.client_models[arch].state_dict()
 
-            flatten_model = TensorBuffer(list(client_model_state_dict.values()))
-            dist.send(tensor=flatten_model.buffer, dst=worker_rank)
+            flatten_model = TensorBuffer(list(client_model_state_dict.values())) # 打包模型参数
+            dist.send(tensor=flatten_model.buffer, dst=worker_rank) # 发送参数到对应模型
             self.conf.logger.log(
                 f"\tMaster send the current model={arch} to process_id={worker_rank}."
             )
@@ -374,7 +377,7 @@ class Master(object):
         meet_flag = False
 
         # consider both of target_perf and early_stopping
-        if self.conf.target_perf is not None:
+        if self.conf.target_perf is not None:   # 是否设置目标性能
             assert 100 >= self.conf.target_perf > 0
 
             # meet the target perf.

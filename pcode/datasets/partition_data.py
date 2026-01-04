@@ -119,7 +119,7 @@ class DataPartitioner(object):
 
     def __init__(
         self, conf, data, partition_sizes, partition_type, consistent_indices=True
-    ):
+    ): # 是否强制所有进程拿到一样的随机结果
         # prepare info.
         self.conf = conf
         self.partition_sizes = partition_sizes
@@ -141,11 +141,11 @@ class DataPartitioner(object):
 
     def partition_indices(self, indices):
         if self.conf.graph.rank == 0:
-            indices = self._create_indices(indices)
+            indices = self._create_indices(indices) # 只有主进程才会进行数据集划分
         if self.consistent_indices:
-            indices = self._get_consistent_indices(indices)
+            indices = self._get_consistent_indices(indices) # 同步下标
 
-        # partition indices.
+        # partition indices.将数据划分并加入self.partitions中
         from_index = 0
         for partition_size in self.partition_sizes:
             to_index = from_index + int(partition_size * self.data_size)
@@ -228,7 +228,7 @@ class DataPartitioner(object):
         if dist.is_initialized():
             # sync the indices over clients.
             indices = torch.IntTensor(indices)
-            dist.broadcast(indices, src=0)
+            dist.broadcast(indices, src=0) # 这里会被阻塞，直到其他进程拿到数据,此后所有进程拿到数据划分
             return list(indices)
         else:
             return indices
@@ -268,7 +268,7 @@ def build_non_iid_by_dirichlet(
 
     #
     idx_batch = []
-    for _targets in tqdm(splitted_targets):
+    for _targets in tqdm(splitted_targets): # 显示进度
         # rebuild _targets.
         _targets = np.array(_targets)
         _targets_size = len(_targets)

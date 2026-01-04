@@ -49,7 +49,7 @@ def _get_cifar(conf, name, root, split, transform, target_transform, download):
 
     # decide data type.
     if is_train:
-        transform = transforms.Compose(
+        transform = transforms.Compose( # 训练数据集要增强
             [
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop((32, 32), 4),
@@ -370,8 +370,8 @@ def get_dataset(
         )
     elif name == "ag_news":
         return _get_ag_news(conf,split)
-    elif name == "dbpedia":
-        return _get_dbpedia(conf,split)
+    # elif name == "dbpedia":
+    #     return _get_dbpedia(conf,split)
     elif name == "sst":
         return _get_sst(conf,split)
     elif name == "Amazon-Google":
