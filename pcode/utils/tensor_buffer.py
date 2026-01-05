@@ -38,6 +38,6 @@ class TensorBuffer:
     def unpack(self, tensors, use_cuda=False):
         for tensor, entry in zip(tensors, self):
             if use_cuda:
-                tensor.data = entry.clone().cuda()
+                tensor.data = entry.clone().cuda()  # data表示对外部变量而非局部变量进行修改
             else:
                 tensor.data = entry.clone()

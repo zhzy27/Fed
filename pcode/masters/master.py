@@ -169,10 +169,10 @@ class Master(object):
             # wait to receive the local models.
             flatten_local_models = self._receive_models_from_selected_clients(
                 selected_client_ids
-            )
+            ) # 接受模型参数
 
             # aggregate the local models and evaluate on the validation dataset.
-            self._aggregate_model_and_evaluate(flatten_local_models, selected_client_ids)
+            self._aggregate_model_and_evaluate(flatten_local_models, selected_client_ids)   # 聚合模型，评估和存档
 
             # evaluate the aggregated model.
             self.conf.logger.log(f"Master finished one round of federated learning.\n")
@@ -239,7 +239,7 @@ class Master(object):
 
         # init the placeholders to recv the local models from workers.
         flatten_local_models = dict()
-        for selected_client_id in selected_client_ids:
+        for selected_client_id in selected_client_ids: # 为接受数据准备容器，这也可以解释为什么要在服务器创建模型
             arch = self.clientid2arch[selected_client_id]
             client_tb = TensorBuffer(
                 list(self.client_models[arch].state_dict().values())
@@ -252,11 +252,11 @@ class Master(object):
         for client_id, world_id in zip(selected_client_ids, self.world_ids):
             req = dist.irecv(
                 tensor=flatten_local_models[client_id].buffer, src=world_id
-            )
+            )   # 这里并不会阻塞，相当于告诉客户端数据放在哪里
             reqs.append(req)
 
         for req in reqs:
-            req.wait()
+            req.wait()  # 这里会阻塞等待数据
 
         dist.barrier()
         self.conf.logger.log(f"Master received all local models.")
@@ -317,7 +317,7 @@ class Master(object):
                 f"Master uniformly average over {len(_flatten_local_models)} received models ({arch})."
             )
 
-            fedavg_model = self._fedavg(flatten_local_models)
+            fedavg_model = self._fedavg(flatten_local_models) # 平均算法
             archs_fedavg_models[arch] = fedavg_model
         return archs_fedavg_models
 
@@ -330,16 +330,16 @@ class Master(object):
         # aggregate the local models.
         client_models = self.aggregate(
             flatten_local_models
-        )
+        ) # 计算平均后的模型
 
         self.master_model.load_state_dict(
             list(client_models.values())[0].state_dict()
-        )
+        ) # 更新全局模型
         for arch, _client_model in client_models.items():
             self.client_models[arch].load_state_dict(_client_model.state_dict())
 
         # evaluate the aggregated model on the test data.
-        master_utils.do_validation(
+        master_utils.do_validation( # 最终评估
             self.conf,
             self.coordinator,
             self.master_model,

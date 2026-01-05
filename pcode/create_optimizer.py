@@ -5,7 +5,7 @@ import torch
 def define_optimizer(conf, model, optimizer_name, lr=None):
     # define the param to optimize.
     weight_decay = conf.weight_decay
-    params = [
+    params = [  # BN层特殊处理，BN的仿射变换不需要L2惩罚
         {
             "params": [value],
             "name": key,
@@ -22,7 +22,7 @@ def define_optimizer(conf, model, optimizer_name, lr=None):
             params,
             lr=conf.lr if lr is None else lr,
             momentum=conf.momentum_factor,
-            nesterov=conf.use_nesterov,
+            nesterov=conf.use_nesterov, # 一种改进动量，不一定使用
         )
     elif optimizer_name == "adam":
         optimizer = torch.optim.Adam(

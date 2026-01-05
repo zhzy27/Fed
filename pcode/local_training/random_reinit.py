@@ -6,7 +6,7 @@ import torch.nn as nn
 
 
 def random_reinit_model(conf, model):
-    if conf.random_reinit_local_model is None:
+    if conf.random_reinit_local_model is None: # 是否随机丢弃参数
         return
     else:
         assert "resnet" in conf.arch or "federated_averaging_cnn" in conf.arch
