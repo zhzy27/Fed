@@ -22,6 +22,8 @@ MethodTable = {
     "fedensemble":[MasterFedEnsemble, Worker]
 }
 
+def random_rank_creator(conf):
+    return np.random.rand(conf.n_clients)
 
 def main(rank, size, conf, port): # rank 为当前进程的序号
     # init the distributed world.
@@ -35,7 +37,10 @@ def main(rank, size, conf, port): # rank 为当前进程的序号
 
     # init the config.
     init_config(conf)
+    if conf.is_random_rank:
+        conf.rank_list = random_rank_creator()
 
+        
     assert MethodTable[conf.method] is not None
     master, worker = MethodTable[conf.method] # 取别名Master, Worker
 
