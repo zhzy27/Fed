@@ -7,3 +7,4 @@ from .master_feddistill import *
 from .master_feddyn import *
 from .master_fedadam import *
 from .master_fedensemble import *
+from .master_fedhm import *
