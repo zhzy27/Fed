@@ -12,6 +12,7 @@ def define_model(
     client_id=None,
     arch=None,
 ):
+    conf.ratio_LR = conf.rank_list[client_id]
     arch, model = define_cv_classification_model(
         conf, client_id, use_complex_arch, arch
     ) # 获取模型
@@ -36,6 +37,9 @@ def determine_arch(conf, client_id, use_complex_arch):
         if _id == 0:
             arch = conf.arch_info["master"]
         else:
+            # if conf.meta:
+            #     archs = ["meta "+str(conf.arch_info["worker"][0])]
+            # else:
             archs = conf.arch_info["worker"]
             if len(conf.arch_info["worker"]) == 1:
                 arch = archs[0]

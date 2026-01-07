@@ -20,7 +20,7 @@ import  time
 import copy
 
 
-class Worker(object):
+class WorkerFedHM(object):
     def __init__(self, conf):
         self.conf = conf
 
@@ -28,7 +28,7 @@ class Worker(object):
         self.rank = conf.graph.rank
         conf.graph.worker_id = conf.graph.rank
         self.device = torch.device("cuda" if self.conf.graph.on_cuda else "cpu")
-
+        conf.device = self.device
         # define the timer for different operations.
         # if we choose the `train_fast` mode, then we will not track the time.
         self.timer = Timer(
@@ -104,6 +104,9 @@ class Worker(object):
         self.conf.graph.client_id, self.conf.graph.comm_round, self.n_local_epochs = (
             msg[:3, self.conf.graph.rank - 1].to(int).cpu().numpy().tolist()
         ) # 取出属于自己的消息
+        
+        if self.conf.rank_list is not None:
+            self.ratio_LR = self.conf.rank_list[self.conf.graph.client_id - 1]  # 取出属于自己的秩
 
         # once we receive the signal, we init for the local training.
         self.arch, self.model = create_model.define_model(
@@ -172,8 +175,8 @@ class Worker(object):
     def prepare_train(self):
         self._prepare_train()
 
-    def local_training_with_extra_calculate(self, loss, output, data_batch, feature):
-        return loss
+    def local_training_with_extra_calculate(self, loss, output, data_batch, feature = None):
+        return loss + self.model.L2_decay()
 
     def add_grad(self):
         pass
@@ -193,11 +196,10 @@ class Worker(object):
 
                 # inference and get current performance.
                 with self.timer("forward_pass", epoch=self.scheduler.epoch_):
-                    loss, performance, feature, output = self._inference(data_batch)    # 前向传播
+                    loss, performance, output = self._inference(data_batch)    # 前向传播
 
                 with self.timer("extra_forward_pass", epoch=self.scheduler.epoch_):
-                    loss = self.local_training_with_extra_calculate(loss, output, data_batch, feature)  # 这里没有额外的训练
-
+                    loss = self.local_training_with_extra_calculate(loss, output, data_batch)  # 计算L2损失
                 with self.timer("backward_pass", epoch=self.scheduler.epoch_):
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -240,7 +242,7 @@ class Worker(object):
     def _inference(self, data_batch):
         """Inference on the given model and get loss and accuracy."""
         # do the forward pass and get the output.
-        feature, output = self.model(data_batch["input"]) 
+        _,output = self.model(data_batch["input"]) 
 
         # evaluate the output and get the loss, performance.
         if self.conf.use_mixup:
@@ -272,7 +274,7 @@ class Worker(object):
                 self.tracker.update_local_metrics(
                     performance[idx - 1], idx, n_samples=bsz
                 )
-        return loss, performance, feature, output
+        return loss, performance, output
 
     def attention(self, x):
         """

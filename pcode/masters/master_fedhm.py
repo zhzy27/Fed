@@ -15,7 +15,9 @@ import pcode.utils.checkpoint as checkpoint
 from pcode.utils.tensor_buffer import TensorBuffer
 import pcode.utils.cross_entropy as cross_entropy
 from pcode.utils.early_stopping import EarlyStoppingTracker
-
+import torch.nn.utils as torch_utils
+from pcode.models.resnet import MetaBasicBlock
+from torch import nn
 
 class MasterFedHM(object):
     def __init__(self, conf):
@@ -25,27 +27,39 @@ class MasterFedHM(object):
         self.client_ids = list(range(1, 1 + conf.n_clients))
         self.world_ids = list(range(1, 1 + conf.n_participated))
 
+        assert conf.meta == True
+
         # create model as well as their corresponding state_dicts.
-        _, self.master_model = create_model.define_model( # 获取模型
-            conf, to_consistent_model=False
-        )
-        self.used_client_archs = set( # set去重，打印所有客户端架构
-            [
-                create_model.determine_arch(conf, client_id, use_complex_arch=True)
-                for client_id in range(1, 1 + conf.n_clients)
-            ]
-        )
+        # 获取未分解的模型
+        # _, self.master_model = create_model.define_model( # 获取全局模型
+        #     conf, to_consistent_model=False
+        # )
+        # 恢复全局模型
+
+
+        self.used_client_archs =[create_model.determine_arch(conf, client_id, use_complex_arch=True) for client_id in range(1, 1 + conf.n_clients)]  # 所有客户端模型架构名称
+
+        
         self.conf.used_client_archs = self.used_client_archs
 
         conf.logger.log(f"The client will use archs={self.used_client_archs}.")
         conf.logger.log("Master created model templates for client models.")
 
-        self.client_models = dict( # 获取客户端模型信息
-            create_model.define_model(conf, to_consistent_model=False, arch=arch)
-            for arch in self.used_client_archs
-        )
+        self.client_models = [ # 获取客户端模型
+            create_model.define_model(conf, to_consistent_model=False, client_id=i, arch=arch)
+            for i,arch in enumerate(self.used_client_archs)
+        ]
 
-        self.clientid2arch = dict( # 获取所有客户端的模型名称
+        # 拷贝构建全局模型
+
+        self.master_model = copy.deepcopy(self.client_models[0][1])
+        for m in self.master_model.modules():
+                if isinstance(m, MetaBasicBlock):
+                    m.recover()
+
+
+        self.decom_recover_loss()
+        self.clientid2arch = list( # 获取所有客户端的模型名称
             (
                 client_id,
                 create_model.determine_arch(
@@ -126,7 +140,65 @@ class MasterFedHM(object):
         conf.is_finished = False    # 用于控制全局训练是否已经结束
         checkpoint.save_arguments(conf) # 将超参数保存在json文件中
 
+
+
+    def decom_recover_loss(self):
+        self.master_model.eval()
+        self.master_model.to('cuda')
+        old_state_dict = copy.deepcopy(self.master_model.state_dict())
+
+
+        for m in self.master_model.modules():
+                if isinstance(m, MetaBasicBlock):
+                    m.decom(100000000)
+
+
+        self.master_model.to('cuda')
+        for m in self.master_model.modules():
+                if isinstance(m, MetaBasicBlock):
+                    m.recover()
+        
+        new_state_dict = copy.deepcopy(self.master_model.state_dict())
+        
+        total_diff = 0.0
+        max_diff = 0.0
+
+        for key in old_state_dict:
+            # 只比较卷积层权重，跳过 num_batches_tracked 等统计量
+            if 'weight' in key or 'bias' in key:
+                w_old = old_state_dict[key].float()
+                # 确保 new_state_dict 里有这个 key (因为分解层结构变了又变回来，key 应该一致)
+                if key in new_state_dict:
+                    w_new = new_state_dict[key].float()
+                    # 计算两个张量的差异 (L1 距离)
+                    diff = (w_old - w_new).abs().sum().item()
+                    # 记录最大元素级误差
+                    current_max = (w_old - w_new).abs().max().item()
+                    
+                    total_diff += diff
+                    max_diff = max(max_diff, current_max)
+                else:
+                    print(f"⚠️ 警告: Key {key} 在还原后的模型中丢失！")
+
+        self.master_model.to('cpu')
+        
+        print(f"📊 检查结果:")
+        print(f"   累积总误差 (Sum Abs Diff): {total_diff:.4f}")
+        print(f"   最大单点误差 (Max Abs Diff): {max_diff:.6f}")
+        # 6. 自动判断
+        if max_diff < 1e-3:
+            print("✅ 成功: 还原误差极小。SVD 维度变换逻辑正确！")
+        else:
+            print("❌ 失败: 还原误差过大！")
+            print("   原因可能是：")
+            print("   1. decom/recover 里的 permute/view 维度搞反了 (最可能)。")
+            print("   2. decom 时传入的 Rank 太小，导致信息被大量截断。")
+        print("="*40 + "\n")
+
+        self.master_model.to('cpu')
+
     def run(self):
+
         for comm_round in range(1, 1 + self.conf.n_comm_rounds):
             self.conf.graph.comm_round = comm_round
             self.conf.logger.log(
@@ -214,13 +286,18 @@ class MasterFedHM(object):
         self.conf.logger.log(f"Master activated the selected clients.")
         dist.barrier()
 
+    
+
     def _send_model_to_selected_clients(self, selected_client_ids):
         # the master_model can be large; the client_models can be small and different.
         self.conf.logger.log(f"Master send the models to workers.")
 
+        if self.conf.graph.comm_round != 1:
+            self.updata_selected_clients_models(selected_client_ids)
+
         for worker_rank, selected_client_id in enumerate(selected_client_ids, start=1):
             arch = self.clientid2arch[selected_client_id] # 获取当前循环模型名称
-            client_model_state_dict = self.client_models[arch].state_dict()
+            client_model_state_dict = self.client_models[selected_client_id][1].state_dict()
 
             flatten_model = TensorBuffer(list(client_model_state_dict.values())) # 打包模型参数
             dist.send(tensor=flatten_model.buffer, dst=worker_rank) # 发送参数到对应模型
@@ -242,7 +319,7 @@ class MasterFedHM(object):
         for selected_client_id in selected_client_ids: # 为接受数据准备容器，这也可以解释为什么要在服务器创建模型
             arch = self.clientid2arch[selected_client_id]
             client_tb = TensorBuffer(
-                list(self.client_models[arch].state_dict().values())
+                list(self.client_models[selected_client_id][1].state_dict().values())
             )
             client_tb.buffer = torch.zeros_like(client_tb.buffer)
             flatten_local_models[selected_client_id] = client_tb
@@ -321,22 +398,149 @@ class MasterFedHM(object):
             archs_fedavg_models[arch] = fedavg_model
         return archs_fedavg_models
 
-    def aggregate(self, flatten_local_models):
+
+    def aggregate(self, flatten_local_models, selected_client_ids):
         # uniformly average local models with the same architecture.
-        fedavg_models = self._avg_over_archs(flatten_local_models)
+        self.load_para2selectedmodels(flatten_local_models, selected_client_ids)    # 把收到参数放入self.clientmodels模型中
+        
+        fedavg_models = self.recover_aggrevate(selected_client_ids)
         return fedavg_models
+
+    def updata_selected_clients_models(self, selected_client_ids):
+        # 注意检查变量名：之前你用的是 conf.list_rank 还是 conf.rank_list？
+        # 假设之前保存的是 conf.list_rank
+        rank_list = self.conf.rank_list 
+        
+        # 获取 Master 参数（放在 CPU 上以节省显存，如果都在 GPU 则不需要 .cpu()）
+        master_model_state_dict = self.master_model.state_dict()
+
+        for selected_client_id in selected_client_ids:
+            model = self.client_models[selected_client_id][1] # 取出模型对象
+            model.to('cuda')
+            # -----------------------------------------------------------
+            # 【步骤 1：结构对齐】
+            # 在加载参数前，必须先检查模型是否处于分解状态。
+            # 如果是分解状态（FactorizedConv），必须先 recover 回 Conv2d，
+            # 否则 load_state_dict 会因为 Key 不匹配或形状不匹配而报错。
+            # -----------------------------------------------------------
+            for m in model.modules():
+                if isinstance(m, MetaBasicBlock):
+                    # 判断依据：如果 conv1 不是标准的 Conv2d，说明它是分解过的 FactorizedConv
+                    if not isinstance(m.conv1, nn.Conv2d):
+                        m.recover()
+            model.to('cuda')
+            # -----------------------------------------------------------
+            # 【步骤 2：加载全量参数】
+            # 现在 model 结构和 master 一模一样了，可以安全加载
+            # -----------------------------------------------------------
+            model.load_state_dict(master_model_state_dict)
+
+            # -----------------------------------------------------------
+            # 【步骤 3：按需分解】
+            # 根据该客户端特定的 rank 进行 SVD 分解
+            # -----------------------------------------------------------
+            current_rank = rank_list[selected_client_id] # 获取该客户端对应的 rank (或 ratio)
+            
+            for m in model.modules():
+                if isinstance(m, MetaBasicBlock):
+                    # 这里的 decom 内部会执行 SVD 并把 Conv2d 替换为 FactorizedConv
+                    m.decom(current_rank)
+            model.to('cpu')
+    def recover_aggrevate(self, selected_client_ids):
+        """
+        1. 遍历 selected_client_ids 中的每个模型。
+        2. 找到模型中所有的 MetaBasicBlock，调用其 recover() 方法将其恢复为标准卷积。
+        3. 对恢复后的模型进行参数平均聚合。
+        4. 返回聚合后的新模型。
+        """
+        
+        # --- 第一步：恢复所有选中的模型 ---
+        # 注意：这里会直接修改 self.client_models 中存储的模型对象结构
+        for client_id in selected_client_ids:
+            # 获取模型对象 (记得取元组的第2个元素)
+            model = self.client_models[client_id][1]
+            
+            # 使用 modules() 递归遍历所有子模块，确保涵盖 body 和 personalized 中的所有块
+            # 这里的 MetaBasicBlock 需要确保你的代码环境中能访问到该类定义
+            for m in model.modules():
+                if isinstance(m, MetaBasicBlock):
+                    # 调用你提供的 recover 方法，它会将 FactorizedConv 替换回 Conv2d
+                    m.recover()
+
+        # --- 第二步：初始化聚合容器 ---
+        # 选取第一个模型作为聚合的“底板”
+        base_client_id = selected_client_ids[0]
+        base_model = self.client_models[base_client_id][1]
+        
+        # 深拷贝一份 state_dict 用于累加，避免修改原模型数据
+        global_params = copy.deepcopy(base_model.state_dict())
+        
+        # 将容器清零，准备累加
+        for key in global_params:
+            global_params[key].zero_()
+
+        # --- 第三步：累加所有模型的参数 ---
+        for client_id in selected_client_ids:
+            model = self.client_models[client_id][1]
+            local_params = model.state_dict()
+            
+            for key in global_params:
+                # 累加参数
+                # 注意：需保证所有模型在同一设备上 (CPU/GPU)
+                global_params[key] += local_params[key]
+
+        # --- 第四步：取平均 ---
+        num_models = len(selected_client_ids)
+        for key in global_params:
+            # 区分浮点数参数和整数参数 (如 BatchNorm 的 num_batches_tracked)
+            if global_params[key].is_floating_point():
+                global_params[key] /= num_models
+            else:
+                global_params[key] //= num_models
+
+        # --- 第五步：构建返回的模型对象 ---
+        # 我们深拷贝一个已经恢复结构的模型作为载体
+        aggregated_model = copy.deepcopy(base_model)
+        # 加载计算好的平均参数
+        aggregated_model.load_state_dict(global_params)
+
+        return aggregated_model
+
+    def load_para2selectedmodels(self, flatten_local_models, selected_client_ids):
+        for client_id in selected_client_ids:
+            model = self.client_models[client_id][1]
+            flat_params = flatten_local_models[client_id].buffer
+        
+        # 这一行直接完成参数赋值
+            torch_utils.vector_to_parameters(flat_params, model.parameters())
+
+
 
     def _aggregate_model_and_evaluate(self, flatten_local_models, selected_client_ids):
         # aggregate the local models.
-        client_models = self.aggregate(
-            flatten_local_models
+        aggregated_model = self.aggregate(
+            flatten_local_models,
+            selected_client_ids
         ) # 计算平均后的模型
+
+        client_models = {0: aggregated_model}
 
         self.master_model.load_state_dict(
             list(client_models.values())[0].state_dict()
         ) # 更新全局模型
-        for arch, _client_model in client_models.items():
-            self.client_models[arch].load_state_dict(_client_model.state_dict())
+        # for arch, _client_model in client_models.items():
+        #     self.client_models[arch].load_state_dict(_client_model.state_dict())
+
+        # for arch, _client_model in client_models.items():
+        #     # arch 现在是 0
+        #     if arch in self.client_models:
+        #         target = self.client_models[arch]
+                
+        #         # 【修复重点】判断是否为元组，如果是，取第2个元素
+        #         if isinstance(target, tuple):
+        #             target[1].load_state_dict(_client_model.state_dict())
+        #         else:
+        #             target.load_state_dict(_client_model.state_dict())
 
         # evaluate the aggregated model on the test data.
         master_utils.do_validation( # 最终评估

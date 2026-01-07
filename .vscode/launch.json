@@ -11,7 +11,7 @@
             "args": [
                 "--arch", "resnet8", // 模型名称
                 "--complex_arch", "master=resnet8,worker=resnet8", //复杂和简单模型
-                "--method", "fedavg", // 聚合算法
+                "--method", "fedhm", // 聚合算法
                 "--experiment", "demo", 
                 "--group_norm_num_groups=16",  //组归一化个数
                 "--data", "cifar10",
@@ -26,8 +26,8 @@
                 "--val_data_ratio", "0.1", // 训练集划分多少给验证集
                 "--n_clients", "20",
                 "--participation_ratio", "0.2", // 客户端参与率
-                "--n_comm_rounds", "2",
-                "--local_n_epochs", "20",      // 本地轮次
+                "--n_comm_rounds", "50",
+                "--local_n_epochs", "5",      // 本地轮次
                 "--world_conf", "0,0,1,1,100", //这里指定GPU序列
                 "--on_cuda", "True",
                 //"--fl_aggregate", "scheme=federated_average",
@@ -39,7 +39,7 @@
                 "--lr_warmup_epochs_upper_bound", "150",
                 "--lr_scheduler", "MultiStepLR",
                 "--lr_decay", "0.1",
-                "--weight_decay", "1e-5", // 权重衰减，不作用于BN层的仿射变换
+                "--weight_decay", "0", // 权重衰减，不作用于BN层的仿射变换
                 "--use_nesterov", "False",
                 "--momentum_factor", "0.9", //sgd的冲量
                 "--track_time", "True",
@@ -50,10 +50,10 @@
                 "--pn_normalize", "True", //数据集是否进程归一化
                 "--same_seed_process", "False", //是否每个客户端使用相同的种子
                 "--port","50022",
-                "--meta","False",
+                "--meta","True",
                 "--decom_rule", "0", "0",
                 "--ratio_LR", "0.2",
-                "--is_random_rank", "False"
+                "--is_random_rank", "True"
             ]
         }
     ]

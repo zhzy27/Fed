@@ -6,7 +6,7 @@ import torch
 import numpy as np
 
 
-__all__ = ["resnet"]
+__all__ = ["resnet","MetaBasicBlock"]
 
 
 def decom_conv(in_channels, out_channels, kernel_size=3, stride=1, bias=True):
@@ -64,10 +64,40 @@ class FactorizedConv(nn.Module):
         loss = torch.norm(torch.matmul(U, torch.transpose(VT, 0, 1)), p='fro')**2
         return loss
 
+    # def L2_loss(self):
+    #     conv1 = self.conv[0]
+    #     conv2 = self.conv[1]
+    #     loss = torch.norm(conv1.weight, p='fro')**2 + torch.norm(conv2.weight, p='fro')**2
+    #     return loss
+
+    # 在 FactorizedConv 类中
     def L2_loss(self):
-        conv1 = self.conv[0]
-        conv2 = self.conv[1]
-        loss = torch.norm(conv1.weight, p='fro')**2 + torch.norm(conv2.weight, p='fro')**2
+        # 获取两个分解层的权重
+        # conv[0] (V): shape [rank, in, 1, 3]
+        # conv[1] (U): shape [out, rank, 3, 1]
+        w_v = self.conv[0].weight 
+        w_u = self.conv[1].weight
+        
+        # 1. 处理 V (右矩阵) -> 变为 [rank, In*3]
+        # 展平: (rank, in, 1, 3) -> (rank, in * 3)
+        mat_v = w_v.view(w_v.shape[0], -1) 
+        
+        # 2. 处理 U (左矩阵) -> 变为 [Out*3, rank]
+        # 这里的变换必须是你 _decompose_layer 的逆过程
+        # 原始生成: U_prime.view(out, 3, rank).permute(0, 2, 1).unsqueeze(-1)
+        # 现在还原:
+        # [out, rank, 3, 1] -> squeeze -> [out, rank, 3]
+        # -> permute(0, 2, 1) -> [out, 3, rank]
+        # -> view -> [out*3, rank]
+        mat_u = w_u.squeeze(-1).permute(0, 2, 1).reshape(-1, w_u.shape[1])
+        
+        # 3. 虚拟矩阵乘法 (不改变模型结构，只计算值)
+        # [Out*3, rank] @ [rank, In*3] -> [Out*3, In*3]
+        w_rec = torch.matmul(mat_u, mat_v)
+        
+        # 4. 计算 L2 范数 (Frobenius Norm) 的平方
+        loss = (w_rec ** 2).sum()
+        
         return loss
 
     def kronecker_loss(self):
@@ -267,9 +297,19 @@ class MetaBasicBlock(nn.Module):
         return (loss1 + loss2)
 
     def L2_loss(self):
-        loss1 = self.conv1.L2_loss()
-        loss2 = self.conv2.L2_loss()
-        return (loss1 + loss2)
+        loss = 0.0
+        
+        # 遍历两个主要的卷积层
+        for layer in [self.conv1, self.conv2]:
+            # 情况 A: 是分解层 (FactorizedConv)，调用它自定义的乘积 L2
+            if hasattr(layer, 'L2_loss'):
+                loss += layer.L2_loss()
+            
+            # 情况 B: 是普通层 (nn.Conv2d)，直接计算权重平方和
+            elif isinstance(layer, nn.Conv2d):
+                loss += (layer.weight ** 2).sum()
+        
+        return loss
 
     def forward(self, x):
         residual = x
@@ -308,7 +348,7 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
                  decom_rule = (4, 0).
         """
         self.cfg = cfg
-        self.dataset_name = cfg['dataset_name']
+        self.dataset_name = cfg.data
         self.decom_rule = decom_rule # [0,0] 表示从第零个阶段的第零个残差块开始分解
 
         self.inplanes = hidden_size[0] # 动态记录当前卷积输出通道，初始化为64
@@ -329,7 +369,7 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
         strides = [1, 2, 2, 2]
         all_layers, common_layers, personalized_layers = [], [], []
         common_layers.append(self.head)
-        for block_idx in range(4):
+        for block_idx in range(len(hidden_size)):
             if block_idx < self.decom_rule[0]: # 看该阶段（块）是否需要分解
                 layer = self._make_larger_layer(block=block, planes=hidden_size[block_idx],
                                                 blocks=num_blocks[block_idx],
@@ -509,7 +549,7 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
 
 
     def L2_decay(self):
-        loss = torch.tensor(0.).to(self.cfg['device'])
+        loss = torch.tensor(0.).to(self.cfg.device)
         length = len(self.personalized)
         for idx, block in enumerate(self.personalized):
             # the last part of self.personalized is linear layer which is not decomposed
@@ -520,6 +560,16 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
                     for j in range(len(block)):
                         loss += block[j].L2_loss()
         return loss
+
+    # def L2_decay(self):
+    #     loss = torch.tensor(0.).to(self.cfg.device)
+    #     length = len(self.personalized)
+    #     for idx, block in enumerate(self.personalized):
+    #         # the last part of self.personalized is linear layer which is not decomposed
+    #         if idx < length - 1:
+    #             loss += block.L2_loss()
+                
+    #     return loss
 
 
     def cal_smallest_svdvals(self): # 计算奇异值最小值，论证论文中的理论部分，分解后的奇异值有下界
@@ -550,9 +600,10 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
 
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
+        feature = x
         x = self.tail(x)
 
-        return x
+        return feature,x
 
 
 
@@ -588,6 +639,20 @@ class BasicBlock(nn.Module):
 
         self.downsample = downsample
         self.stride = stride
+
+    def L2_loss(self):
+        loss = 0.0
+        
+        loss += (self.conv1.weight ** 2).sum()
+        
+        loss += (self.conv2.weight ** 2).sum()
+        
+        if self.downsample is not None:
+            for m in self.downsample:
+                if isinstance(m, nn.Conv2d):
+                    loss += (m.weight ** 2).sum()
+                    
+        return loss
 
     def forward(self, x):
         residual = x
@@ -1037,9 +1102,9 @@ def hybrid_resnet34(model_rate=1, ratio_LR=1, decom_rule=[1, 1], track=False, cf
     return model
 
 def hybrid_resnet8(ratio_LR=1, decom_rule=[1, 1], track=False, cfg=None):
-    data_shape = cfg['data_shape']
-    classes_size = cfg['classes_size']
-    hidden_size = cfg['resnet']['hidden_size']
+    data_shape = cfg.data_shape
+    classes_size = cfg.classes_size
+    hidden_size = cfg.resnet.hidden_size
     model = HyperResNet(data_shape, hidden_size, BasicBlock, [1,1,1], ratio_LR=ratio_LR,
                         decom_rule=decom_rule, num_classes=classes_size, track=track, cfg=cfg)
     return model

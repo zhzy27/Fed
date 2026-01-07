@@ -19,7 +19,8 @@ MethodTable = {
     "feddyn":[MasterFedDyn, WorkerFedDyn],
     "fedadam":[MasterFedAdam, Worker],
     "fedadam_gkd":[MasterFedAdam, WorkerFedGKD],
-    "fedensemble":[MasterFedEnsemble, Worker]
+    "fedensemble":[MasterFedEnsemble, Worker],
+    "fedhm":[MasterFedHM, WorkerFedHM],
 }
 
 def random_rank_creator(conf):
@@ -37,10 +38,9 @@ def main(rank, size, conf, port): # rank 为当前进程的序号
 
     # init the config.
     init_config(conf)
-    if conf.is_random_rank:
-        conf.rank_list = random_rank_creator()
+    
 
-        
+
     assert MethodTable[conf.method] is not None
     master, worker = MethodTable[conf.method] # 取别名Master, Worker
 
@@ -110,6 +110,8 @@ if __name__ == "__main__":
     conf.timestamp = str(int(time.time()))
     size = conf.n_participated + 1 # 这里是启动进程数量，客户端 + 一个服务器
     processes = []
+    if conf.is_random_rank:
+        conf.rank_list = random_rank_creator(conf)
 
     mp.set_start_method("spawn") # 设置子进程启动方式，子进程只会继承运行所需的资源（run 参数），它不会像 fork 那样直接复制父进程的所有内存空间。因此，子进程启动时会重新导入并执行代码中的模块。
     for rank in range(size):

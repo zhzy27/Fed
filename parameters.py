@@ -244,15 +244,17 @@ def get_args():
 
     # parse conf.
     conf = parser.parse_args()
-    if conf['data'] == 'cifar10':
-        conf['classes_size'] = 10  
-        conf['data_shape'] = [3, 32, 32]
+    if conf.data == 'cifar10':
+        conf.classes_size = 10  
+        conf.data_shape = [3, 32, 32]
 
 
-    if conf['arch'] == 'resnet18':
-        conf['resnet']['hidden_size'] = [64, 128, 256, 512]
-    elif conf['arch'] == 'resnet8':
-        conf['resnet']['hidden_size'] = [64, 128, 256]
+    if conf.arch == 'resnet18':
+        conf.resnet = argparse.Namespace()
+        conf.resnet.hidden_size = [64, 128, 256, 512]
+    elif conf.arch == 'resnet8':
+        conf.resnet = argparse.Namespace()
+        conf.resnet.hidden_size = [64, 128, 256]
 
 
     return conf
