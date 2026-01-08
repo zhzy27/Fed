@@ -294,8 +294,8 @@ class MasterFedHM(object):
         # the master_model can be large; the client_models can be small and different.
         self.conf.logger.log(f"Master send the models to workers.")
 
-        if self.conf.graph.comm_round != 1:
-            self.updata_selected_clients_models(selected_client_ids)
+        
+        self.updata_selected_clients_models(selected_client_ids)
 
         for worker_rank, selected_client_id in enumerate(selected_client_ids, start=1):
             arch = self.clientid2arch[selected_client_id] # 获取当前循环模型名称
@@ -571,9 +571,6 @@ class MasterFedHM(object):
 
         
         )
-        for name, param in aggregated_model.named_buffers():
-            if "running_var" in name:
-                print(f"Layer {name}: Mean Var = {param.mean().item()}")
                 
          # 更新全局模型
         # for arch, _client_model in client_models.items():

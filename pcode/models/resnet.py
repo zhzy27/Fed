@@ -335,7 +335,7 @@ class MetaBasicBlock(nn.Module):
 class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有两个残差块 每个残差块包括两个3x3的卷积
 
     def __init__(self, data_shape, hidden_size, block, num_blocks, ratio_LR, decom_rule, num_classes=10,
-                 rate=1, track=None, cfg=None, dropout_rate=0, ):
+                 rate=1, track=None, cfg=None, dropout_rate=0, group_norm_num_groups = None ):
         super(HyperResNet, self).__init__()
         """
         decom_rule is a 2-tuple like (block_index, layer_index).
@@ -350,7 +350,7 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
         self.cfg = cfg
         self.dataset_name = cfg.data
         self.decom_rule = decom_rule # [0,0] 表示从第零个阶段的第零个残差块开始分解
-
+        self.group_norm_num_groups = group_norm_num_groups
         self.inplanes = hidden_size[0] # 动态记录当前卷积输出通道，初始化为64
         self.hidden_size = hidden_size # 四个阶段的输出通道数量
         self.num_blocks = num_blocks    # 每个resnet阶段的残差块数量
@@ -424,13 +424,13 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
 
         layers = []
 
-        layers.append(block(self.inplanes, planes, stride=stride, n_basis=config, downsample=downsample,
+        layers.append(block(self.inplanes, planes, stride=stride, n_basis=config, downsample=downsample, group_norm_num_groups=self.group_norm_num_groups,
                             dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg))
 
         self.inplanes = planes * block.expansion
         for i in range(1, blocks):
             layers.append(
-                block(self.inplanes, planes, stride=1, n_basis=config, dropout_rate=self.dropout_rate, rate=rate,
+                block(self.inplanes, planes, stride=1, n_basis=config, dropout_rate=self.dropout_rate, rate=rate,group_norm_num_groups=self.group_norm_num_groups,
                       track=track, cfg=cfg))
         return nn.Sequential(*layers)
 
@@ -452,12 +452,12 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
         if start_decom_idx == 0:
             block = meta_block # 这又写重叠了,其中meta_block是分解后的残差块（即两层卷积的分解）
             layers.append(
-                block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate,
+                block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate,group_norm_num_groups=self.group_norm_num_groups,
                       n_basis=config, track=track, cfg=cfg)) # 这里面要不是分解地两层卷积层，要不是未分解地
         else:
             block = large_block
             layers.append(
-                block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate,
+                block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate,group_norm_num_groups=self.group_norm_num_groups,
                       track=track, cfg=cfg))
         self.inplanes = planes * block.expansion # 保证维度一致
 
@@ -466,11 +466,11 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
             if idx < start_decom_idx:
                 block = large_block
                 layers.append(
-                    block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg))
+                    block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg,group_norm_num_groups=self.group_norm_num_groups,))
             else:
                 block = meta_block
                 layers.append(
-                    block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, n_basis=config, track=track,
+                    block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, n_basis=config, track=track,group_norm_num_groups=self.group_norm_num_groups,
                           cfg=cfg))
 
         return nn.Sequential(*layers)
@@ -486,12 +486,12 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
             )
         layers = []
         layers.append(
-            block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate,
+            block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate, group_norm_num_groups=self.group_norm_num_groups,
                   track=track, cfg=cfg))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
             layers.append(
-                block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg))
+                block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg, group_norm_num_groups=self.group_norm_num_groups,))
 
         return nn.Sequential(*layers)
 
@@ -627,7 +627,11 @@ class BasicBlock(nn.Module):
         stride=1,
         downsample=None,
         group_norm_num_groups=None,
-        track_running_stats=True
+        track_running_stats=True,
+        dropout_rate = 0,
+        rate=1, 
+        track=None,
+        cfg=None
     ):
         super(BasicBlock, self).__init__()
         self.conv1 = conv3x3(in_planes, out_planes, stride)
@@ -1077,10 +1081,10 @@ class CifarResNet(ResNetBase):
 
 def hybrid_resnet18(ratio_LR=1, decom_rule=[1, 1], track=False, cfg=None):
 
-    data_shape = cfg['data_shape']
-    classes_size = cfg['classes_size']
-    hidden_size = cfg['resnet']['hidden_size']
-    model = HyperResNet(data_shape, hidden_size, BasicBlock, [2, 2, 2, 2], ratio_LR=ratio_LR,
+    data_shape = cfg.data_shape
+    classes_size = cfg.classes_size
+    hidden_size = cfg.resnet.hidden_size
+    model = HyperResNet(data_shape, hidden_size, BasicBlock, [2, 2, 2, 2], ratio_LR=ratio_LR,group_norm_num_groups=cfg.group_norm_num_groups,
                         decom_rule=decom_rule, num_classes=classes_size, track=track, cfg=cfg)
     return model
 
@@ -1096,7 +1100,7 @@ def hybrid_resnet34(model_rate=1, ratio_LR=1, decom_rule=[1, 1], track=False, cf
     classes_size = cfg['classes_size']
     hidden_size = [int(np.ceil(model_rate * x)) for x in cfg['resnet']['hidden_size']]
     scaler_rate = model_rate / cfg['global_model_rate']
-    model = HyperResNet(data_shape, hidden_size, BasicBlock, [3, 4, 6, 3], ratio_LR=ratio_LR, decom_rule=decom_rule,
+    model = HyperResNet(data_shape, hidden_size, BasicBlock, [3, 4, 6, 3], ratio_LR=ratio_LR, decom_rule=decom_rule,group_norm_num_groups=cfg.group_norm_num_groups,
                         num_classes=classes_size, rate=scaler_rate, track=track, cfg=cfg)
     # model.apply(init_param)
     return model
@@ -1105,7 +1109,7 @@ def hybrid_resnet8(ratio_LR=1, decom_rule=[1, 1], track=False, cfg=None):
     data_shape = cfg.data_shape
     classes_size = cfg.classes_size
     hidden_size = cfg.resnet.hidden_size
-    model = HyperResNet(data_shape, hidden_size, BasicBlock, [1,1,1], ratio_LR=ratio_LR,
+    model = HyperResNet( data_shape, hidden_size, BasicBlock, [1,1,1], ratio_LR=ratio_LR, group_norm_num_groups=cfg.group_norm_num_groups,
                         decom_rule=decom_rule, num_classes=classes_size, track=track, cfg=cfg)
     return model
 
@@ -1134,11 +1138,11 @@ def resnet(conf, arch=None):
 
         if conf.meta:
             if conf.arch == "resnet18":
-                model = hybrid_resnet18()
+                model = hybrid_resnet18(ratio_LR=conf.ratio_LR, decom_rule=conf.decom_rule, cfg=conf)
             elif conf.arch == "resnet8":
                 model = hybrid_resnet8(ratio_LR=conf.ratio_LR, decom_rule=conf.decom_rule, cfg=conf)
             elif conf.arch == "resnet34":
-                model.arch = hybrid_resnet34()
+                model.arch = hybrid_resnet34(ratio_LR=conf.ratio_LR, decom_rule=conf.decom_rule, cfg=conf)
         else:
             model = CifarResNet(
                 dataset=dataset,

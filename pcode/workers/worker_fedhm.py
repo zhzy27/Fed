@@ -176,7 +176,7 @@ class WorkerFedHM(object):
         self._prepare_train()
 
     def local_training_with_extra_calculate(self, loss, output, data_batch, feature = None):
-        return loss + 0.0001*self.model.L2_decay()
+        return loss + self.conf.meta_L2*self.model.L2_decay()
 
     def add_grad(self):
         pass
