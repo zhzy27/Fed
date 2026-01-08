@@ -24,7 +24,8 @@ MethodTable = {
 }
 
 def random_rank_creator(conf):
-    return np.random.rand(conf.n_clients)
+    # 直接生成 0.1 到 1.0 之间的均匀分布
+    return np.random.uniform(low=0.1, high=1.0, size=conf.n_clients)
 
 def main(rank, size, conf, port): # rank 为当前进程的序号
     # init the distributed world.

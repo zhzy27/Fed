@@ -58,7 +58,7 @@ class MasterFedHM(object):
                     m.recover()
 
 
-        self.decom_recover_loss()
+        # self.decom_recover_loss()
         self.clientid2arch = list( # 获取所有客户端的模型名称
             (
                 client_id,
@@ -66,7 +66,7 @@ class MasterFedHM(object):
                     conf, client_id=client_id, use_complex_arch=True
                 ),
             )
-            for client_id in range(1, 1 + conf.n_clients)
+            for client_id in range(0, conf.n_clients)
         )
         self.conf.clientid2arch = self.clientid2arch
 
@@ -262,6 +262,8 @@ class MasterFedHM(object):
             self.client_ids, self.conf.n_participated, replace=False
         ).tolist()  # 随机选择客户端
         selected_client_ids.sort()
+        ids = [selected_client_id-1 for selected_client_id in selected_client_ids]
+        selected_client_ids = ids
         self.conf.logger.log(
             f"Master selected {self.conf.n_participated} from {self.conf.n_clients} clients: {selected_client_ids}."
         )
@@ -467,6 +469,25 @@ class MasterFedHM(object):
                     # 调用你提供的 recover 方法，它会将 FactorizedConv 替换回 Conv2d
                     m.recover()
 
+        if not self.conf.train_fast:  # test all the selected_clients
+            for client_idx in selected_client_ids:
+                # _arch = self.clientid2arch[client_idx]
+                # _model_state_dict = copy.deepcopy(self.client_models[client_idx][1].state_dict())
+                # flatten_local_model.unpack(_model_state_dict.values())
+                # real_arch = _arch[1] if isinstance(_arch, tuple) else _arch
+                # _, test_model = create_model.define_model(self.conf, to_consistent_model=False, client_id=client_idx , arch=real_arch)
+                # test_model.load_state_dict(_model_state_dict)
+                test_model = copy.deepcopy(self.client_models[client_idx][1])
+                master_utils.do_validation(
+                    conf=self.conf,
+                    coordinator=self.local_coordinator[client_idx],
+                    model=test_model,
+                    criterion=self.criterion,
+                    metrics=self.metrics,
+                    data_loaders=self.test_loaders,
+                    label=f"aggregated_test_loader_{client_idx}",
+                )
+            self.additional_validation()
         # --- 第二步：初始化聚合容器 ---
         # 选取第一个模型作为聚合的“底板”
         base_client_id = selected_client_ids[0]
@@ -508,16 +529,35 @@ class MasterFedHM(object):
 
     def load_para2selectedmodels(self, flatten_local_models, selected_client_ids):
         for client_id in selected_client_ids:
-            model = self.client_models[client_id][1]
-            flat_params = flatten_local_models[client_id].buffer
-        
-        # 这一行直接完成参数赋值
-            torch_utils.vector_to_parameters(flat_params, model.parameters())
+            # 获取对应的模型对象 (注意：需确认 self.client_models 的索引方式是否正确)
+            # 如果 self.client_models 是列表且长度不够，这里可能会报错，请确保初始化时为每个 client_id 都预留了位置
+            if isinstance(self.client_models, list):
+                # 假设 client_id 是 1-based，列表是 0-based
+                target_model = self.client_models[client_id ][1] 
+            elif isinstance(self.client_models, dict):
+                target_model = self.client_models[client_id][1]
+            else:
+                # 根据您的实际结构调整
+                target_model = self.client_models[client_id][1]
+
+            # 【修复重点】使用 state_dict().values() 接收所有参数（含 BN 统计量）
+            # 获取 buffer 对象
+            client_buffer = flatten_local_models[client_id]
+            
+            # 必须先获取 state_dict 的引用
+            target_state_dict = target_model.state_dict()
+            
+            # 使用 TensorBuffer 自带的 unpack 方法填充 state_dict 的 values
+            client_buffer.unpack(target_state_dict.values())
+            
+            # 将更新后的 state_dict 重新加载回模型（确保数据生效）
+            target_model.load_state_dict(target_state_dict)
 
 
 
     def _aggregate_model_and_evaluate(self, flatten_local_models, selected_client_ids):
         # aggregate the local models.
+        self.selected_client_ids = selected_client_ids
         aggregated_model = self.aggregate(
             flatten_local_models,
             selected_client_ids
@@ -527,7 +567,15 @@ class MasterFedHM(object):
 
         self.master_model.load_state_dict(
             list(client_models.values())[0].state_dict()
-        ) # 更新全局模型
+
+
+        
+        )
+        for name, param in aggregated_model.named_buffers():
+            if "running_var" in name:
+                print(f"Layer {name}: Mean Var = {param.mean().item()}")
+                
+         # 更新全局模型
         # for arch, _client_model in client_models.items():
         #     self.client_models[arch].load_state_dict(_client_model.state_dict())
 
@@ -553,17 +601,20 @@ class MasterFedHM(object):
             label=f"aggregated_test_loader_0",
         )
 
+        # self.conf.train_fast=False
+        
         if not self.conf.train_fast:  # test all the selected_clients
-            for client_idx, flatten_local_model in flatten_local_models.items():
-                _arch = self.clientid2arch[client_idx]
-                _model_state_dict = copy.deepcopy(self.client_models[_arch].state_dict())
-                flatten_local_model.unpack(_model_state_dict.values())
-                _, test_model = create_model.define_model(self.conf, to_consistent_model=False, arch=_arch)
-                test_model.load_state_dict(_model_state_dict)
-
+            for client_idx in selected_client_ids:
+                # _arch = self.clientid2arch[client_idx]
+                # _model_state_dict = copy.deepcopy(self.client_models[client_idx][1].state_dict())
+                # flatten_local_model.unpack(_model_state_dict.values())
+                # real_arch = _arch[1] if isinstance(_arch, tuple) else _arch
+                # _, test_model = create_model.define_model(self.conf, to_consistent_model=False, client_id=client_idx , arch=real_arch)
+                # test_model.load_state_dict(_model_state_dict)
+                test_model = copy.deepcopy(self.client_models[client_idx][1])
                 master_utils.do_validation(
                     conf=self.conf,
-                    coordinator=self.local_coordinator[client_idx - 1],
+                    coordinator=self.local_coordinator[client_idx],
                     model=test_model,
                     criterion=self.criterion,
                     metrics=self.metrics,
