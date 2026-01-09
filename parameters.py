@@ -19,16 +19,17 @@ def get_args():
     # feed them to the parser.
     parser = argparse.ArgumentParser(description="PyTorch Training for ConvNet")
 
-    # add arguments. meta_L2
+    # add arguments. meta_L2 freeze_bn
     parser.add_argument("--loss_type",default='kl',type=str)
     parser.add_argument("--port",default='50021',type=str)
-    parser.add_argument("--meta",default=False,type=bool)
+    parser.add_argument("--meta",default=False,type=str2bool)
     parser.add_argument('--decom_rule', default=None, nargs='+', type=int)
     parser.add_argument("--ratio_LR",default=1,type=float)
-    parser.add_argument("--is_random_rank",default=False,type=bool)
+    parser.add_argument("--is_random_rank",default=False,type=str2bool)
     parser.add_argument("--work_dir", default=None, type=str)
     parser.add_argument("--remote_exec", default=False, type=str2bool)
     parser.add_argument("--meta_L2", default=0, type=float)
+
 
     # dataset.
     # 数据集默认是cifar10

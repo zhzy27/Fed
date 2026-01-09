@@ -361,7 +361,9 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
 
         self.head = nn.Sequential(
             nn.Conv2d(data_shape[0], self.inplanes, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64, momentum=None, track_running_stats=None),
+            # nn.BatchNorm2d(64, momentum=None, track_running_stats=None),
+            norm2d(group_norm_num_groups, planes=64, track_running_stats=False),
+            
         ) # 卷积层，输出对应上初始输出通道，这个应该初始层
         self.relu = nn.ReLU(inplace=True) # 一种内存优化手段
 
@@ -409,8 +411,8 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)): 
+                m.weight.data.fill_(1) 
                 m.bias.data.zero_()
 
     def _make_meta_layer(self, block, planes, blocks, config=None, stride=1, rate=1, track=None):
@@ -419,7 +421,8 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
                 nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
+                # nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
+                norm2d(self.group_norm_num_groups, planes=planes * block.expansion, track_running_stats=False),
             )
 
         layers = []
@@ -446,7 +449,8 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
         if stride != 1 or self.inplanes != planes * block.expansion:  # 残差对齐，按stride下采样保证大小相同，用1x1卷积对齐通道数，这里暂时还没用上
             downsample = nn.Sequential(
                 nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
+                # nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
+                norm2d(self.group_norm_num_groups, planes=planes * block.expansion, track_running_stats=False)
             )
         layers = []
         if start_decom_idx == 0:
@@ -482,7 +486,8 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
                 nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
+                # nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
+                norm2d(self.group_norm_num_groups, planes=planes * block.expansion, track_running_stats=False),
             )
         layers = []
         layers.append(
@@ -995,29 +1000,29 @@ class CifarResNet(ResNetBase):
         self.num_classes = self._decide_num_classes()
 
         # define layers.
-        assert int(16 * scaling) > 0
-        self.inplanes = int(16 * scaling) # 第一个残差块的输入通道
+        assert int(64 * scaling) > 0
+        self.inplanes = int(64 * scaling) # 第一个残差块的输入通道
         self.conv1 = nn.Conv2d(
             in_channels=3,
-            out_channels=(16 * scaling),
+            out_channels=(64 * scaling),
             kernel_size=3,
             stride=1,
             padding=1,
             bias=False,
         ) # 初始层
-        self.bn1 = norm2d(group_norm_num_groups, planes=int(16 * scaling),track_running_stats=track_running_stats) # 组归一化
+        self.bn1 = norm2d(group_norm_num_groups, planes=int(64 * scaling),track_running_stats=track_running_stats) # 组归一化
         self.relu = nn.ReLU(inplace=True)
 
         self.layer1 = self._make_block( # 构建block_nums个残差块，每个块两层卷积
             block_fn=block_fn,
-            planes=int(16 * scaling),
+            planes=int(64 * scaling),
             block_num=block_nums,
             group_norm_num_groups=group_norm_num_groups,
             track_running_stats=track_running_stats
         )
         self.layer2 = self._make_block(
             block_fn=block_fn,
-            planes=int(32 * scaling),
+            planes=int(128 * scaling),
             block_num=block_nums,
             stride=2,
             group_norm_num_groups=group_norm_num_groups,
@@ -1025,7 +1030,7 @@ class CifarResNet(ResNetBase):
         )
         self.layer3 = self._make_block(
             block_fn=block_fn,
-            planes=int(64 * scaling),
+            planes=int(256 * scaling),
             block_num=block_nums,
             stride=2,
             group_norm_num_groups=group_norm_num_groups,
@@ -1033,7 +1038,7 @@ class CifarResNet(ResNetBase):
         )
 
         self.avgpool = nn.AvgPool2d(kernel_size=8)
-        feature_dim = int(64 * scaling * block_fn.expansion)
+        feature_dim = int(256 * scaling * block_fn.expansion)
         self.projection = projection
         if self.projection: # 通常用于特征对齐，提升性能
 
@@ -1109,6 +1114,8 @@ def hybrid_resnet8(ratio_LR=1, decom_rule=[1, 1], track=False, cfg=None):
     data_shape = cfg.data_shape
     classes_size = cfg.classes_size
     hidden_size = cfg.resnet.hidden_size
+    if cfg.freeze_bn:
+        track = False
     model = HyperResNet( data_shape, hidden_size, BasicBlock, [1,1,1], ratio_LR=ratio_LR, group_norm_num_groups=cfg.group_norm_num_groups,
                         decom_rule=decom_rule, num_classes=classes_size, track=track, cfg=cfg)
     return model

@@ -12,7 +12,8 @@ def define_model(
     client_id=None,
     arch=None,
 ):
-    conf.ratio_LR = conf.rank_list[client_id]
+    if conf.is_random_rank: 
+        conf.ratio_LR = conf.rank_list[client_id]
     arch, model = define_cv_classification_model(
         conf, client_id, use_complex_arch, arch
     ) # 获取模型

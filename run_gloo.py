@@ -24,8 +24,13 @@ MethodTable = {
 }
 
 def random_rank_creator(conf):
-    # 直接生成 0.1 到 1.0 之间的均匀分布
-    return np.random.uniform(low=0.1, high=1.0, size=conf.n_clients)
+    # 定义候选的 rank 值
+    candidates = [1, 0.5, 0.25, 0.125]
+    
+    # 从候选列表中随机采样，size 指定生成数量
+    # replace=True (默认) 表示允许重复选择同一个值
+    return np.random.choice(candidates, size=conf.n_clients)
+    # return np.random.uniform(low=0.1, high=1.0, size=conf.n_clients)
 
 def main(rank, size, conf, port): # rank 为当前进程的序号
     # init the distributed world.
