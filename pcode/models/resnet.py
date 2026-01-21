@@ -362,7 +362,7 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
         self.head = nn.Sequential(
             nn.Conv2d(data_shape[0], self.inplanes, kernel_size=3, stride=1, padding=1, bias=False),
             # nn.BatchNorm2d(64, momentum=None, track_running_stats=None),
-            norm2d(group_norm_num_groups, planes=64, track_running_stats=False),
+            norm2d(group_norm_num_groups, planes=self.inplanes, track_running_stats=False),
             
         ) # 卷积层，输出对应上初始输出通道，这个应该初始层
         self.relu = nn.ReLU(inplace=True) # 一种内存优化手段
@@ -553,28 +553,57 @@ class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有�
         return loss
 
 
-    def L2_decay(self):
-        loss = torch.tensor(0.).to(self.cfg.device)
-        length = len(self.personalized)
-        for idx, block in enumerate(self.personalized):
-            # the last part of self.personalized is linear layer which is not decomposed
-            if idx < length - 1:
-                if isinstance(block, MetaBasicBlock):
-                    loss += block.L2_loss()
-                else:
-                    for j in range(len(block)):
-                        loss += block[j].L2_loss()
-        return loss
-
     # def L2_decay(self):
     #     loss = torch.tensor(0.).to(self.cfg.device)
     #     length = len(self.personalized)
     #     for idx, block in enumerate(self.personalized):
     #         # the last part of self.personalized is linear layer which is not decomposed
     #         if idx < length - 1:
-    #             loss += block.L2_loss()
-                
+    #             if isinstance(block, MetaBasicBlock):
+    #                 loss += block.L2_loss()
+    #             else:
+    #                 for j in range(len(block)):
+    #                     loss += block[j].L2_loss()
     #     return loss
+
+    def L2_decay(self):
+        loss = torch.tensor(0.).to(self.cfg.device if self.cfg else 'cuda')
+
+        # 定义一个内部函数来递归处理各种层
+        def add_l2_loss(module):
+            local_loss = torch.tensor(0.).to(loss.device)
+            
+            # 情况1: 如果模块有自定义的 L2_loss 方法 (例如 MetaBasicBlock)，优先使用它
+            if hasattr(module, 'L2_loss'):
+                local_loss += module.L2_loss()
+                
+            # 情况2: 如果是基础的带权层 (Conv2d, Linear)，且没有被自定义方法处理过
+            # 注意: MetaBasicBlock 也有 Conv2d，但上面的 hasattr 会拦截它，防止重复计算
+            elif isinstance(module, (nn.Conv2d, nn.Linear)):
+                # 只对 weight 做衰减，通常不对 bias 做 L2 (这也是 PyTorch optim 的默认行为之一，虽然 strict WD 会包含)
+                if module.weight.requires_grad:
+                    local_loss += torch.sum(module.weight ** 2)
+                    
+            # 情况3: 如果是容器 (Sequential, ModuleList, 或普通的 BasicBlock)，递归处理子模块
+            else:
+                for child in module.children():
+                    local_loss += add_l2_loss(child)
+                    
+            return local_loss
+
+        # ------------------------------------------------------
+        # 遍历模型的两个主要部分：Common (前半截) 和 Personalized (后半截)
+        # ------------------------------------------------------
+        
+        # 1. 处理 Common 层 (包含 Head 和 前期全秩 Blocks)
+        # self.common 是一个 nn.Sequential
+        loss += add_l2_loss(self.common)
+
+        # 2. 处理 Personalized 层 (包含 Meta Blocks, 后期 Blocks 和 Tail)
+        # self.personalized 也是一个 nn.Sequential
+        loss += add_l2_loss(self.personalized)
+
+        return loss
 
 
     def cal_smallest_svdvals(self): # 计算奇异值最小值，论证论文中的理论部分，分解后的奇异值有下界
@@ -977,93 +1006,113 @@ class CifarResNet(ResNetBase):
         group_norm_num_groups=None,
         freeze_bn=False,
         freeze_bn_affine=False,
-        projection = False,
-        is_meta = False
+        projection=False,
+        is_meta=False
     ):
         super(CifarResNet, self).__init__()
 
         self.dataset = dataset
-        self.freeze_bn = freeze_bn # 停止统计全局均值和方差：BN 层将不再维护和更新全局的 running_mean（滑动平均均值）和 running_var（滑动平均方差）。
+        self.freeze_bn = freeze_bn
         self.freeze_bn_affine = freeze_bn_affine
-        track_running_stats = not self.freeze_bn # bn层的仿射变换是否有效
+        track_running_stats = not self.freeze_bn
 
-        # define model.
-        if resnet_size % 6 != 2:
-            raise ValueError("resnet_size must be 6n + 2:", resnet_size)
-        block_nums = (resnet_size - 2) // 6
-        block_fn = Bottleneck if resnet_size >= 44 else BasicBlock
+        # --- 1. 修改：层数配置逻辑 ---
+        if resnet_size == 18:
+            # ResNet-18 标准配置: 4个layer, 每个2个block
+            self.layers_config = [2, 2, 2, 2]
+            block_fn = BasicBlock
+            self.has_layer4 = True
+        else:
+            # 原 CIFAR ResNet (20, 32, 44, 56, 110) 配置: 3个layer, 6n+2
+            if resnet_size % 6 != 2:
+                 raise ValueError("resnet_size must be 6n + 2 or 18:", resnet_size)
+            n = (resnet_size - 2) // 6
+            self.layers_config = [n, n, n]
+            block_fn = Bottleneck if resnet_size >= 44 else BasicBlock
+            self.has_layer4 = False
 
-        # if is_meta:
-        #     block_fn = MetaBasicBlock
-
-        # decide the num of classes.
         self.num_classes = self._decide_num_classes()
 
         # define layers.
-        assert int(64 * scaling) > 0
-        self.inplanes = int(64 * scaling) # 第一个残差块的输入通道
+        assert int(16 * scaling) > 0
+        self.inplanes = int(16 * scaling)
         self.conv1 = nn.Conv2d(
             in_channels=3,
-            out_channels=(64 * scaling),
+            out_channels=(16 * scaling),
             kernel_size=3,
             stride=1,
             padding=1,
             bias=False,
-        ) # 初始层
-        self.bn1 = norm2d(group_norm_num_groups, planes=int(64 * scaling),track_running_stats=track_running_stats) # 组归一化
+        )
+        self.bn1 = norm2d(group_norm_num_groups, planes=int(16 * scaling), track_running_stats=track_running_stats)
         self.relu = nn.ReLU(inplace=True)
 
-        self.layer1 = self._make_block( # 构建block_nums个残差块，每个块两层卷积
+        # Layer 1
+        self.layer1 = self._make_block(
             block_fn=block_fn,
-            planes=int(64 * scaling),
-            block_num=block_nums,
+            planes=int(16 * scaling),
+            block_num=self.layers_config[0],
             group_norm_num_groups=group_norm_num_groups,
             track_running_stats=track_running_stats
         )
+        # Layer 2
         self.layer2 = self._make_block(
             block_fn=block_fn,
-            planes=int(128 * scaling),
-            block_num=block_nums,
+            planes=int(32 * scaling),
+            block_num=self.layers_config[1],
             stride=2,
             group_norm_num_groups=group_norm_num_groups,
             track_running_stats=track_running_stats
         )
+        # Layer 3
         self.layer3 = self._make_block(
             block_fn=block_fn,
-            planes=int(256 * scaling),
-            block_num=block_nums,
+            planes=int(64 * scaling),
+            block_num=self.layers_config[2],
             stride=2,
             group_norm_num_groups=group_norm_num_groups,
             track_running_stats=track_running_stats
         )
 
-        self.avgpool = nn.AvgPool2d(kernel_size=8)
-        feature_dim = int(256 * scaling * block_fn.expansion)
-        self.projection = projection
-        if self.projection: # 通常用于特征对齐，提升性能
-
-            self.projection_layer = nn.Sequential(
-                nn.Linear(feature_dim,feature_dim),
-                nn.ReLU(),
-                nn.Linear(feature_dim,256)
+        # --- 2. 修改：添加 Layer 4 (仅针对 ResNet-18) ---
+        if self.has_layer4:
+            self.layer4 = self._make_block(
+                block_fn=block_fn,
+                planes=int(128 * scaling), # 再次翻倍
+                block_num=self.layers_config[3],
+                stride=2,
+                group_norm_num_groups=group_norm_num_groups,
+                track_running_stats=track_running_stats
             )
-            self.classifier = nn.Linear(
-                in_features=256,
-                out_features=self.num_classes,
-            )
+            final_planes = int(128 * scaling)
+            # ResNet-18 经过3次下采样(stride=2)，32x32 -> 4x4
+            # 所以 avgpool kernel_size 应为 4
+            pool_kernel = 4
         else:
-            self.classifier = nn.Linear(
-                in_features=feature_dim,
-                out_features=self.num_classes,
-            )
-        # weight initialization based on layer type.
-        self._weight_initialization()
+            final_planes = int(64 * scaling)
+            # ResNet-20等 经过2次下采样(layer2, layer3)，32x32 -> 8x8
+            pool_kernel = 8
 
-        # a placeholder for activations in the intermediate layers.
+        self.avgpool = nn.AvgPool2d(kernel_size=pool_kernel)
+        
+        feature_dim = int(final_planes * block_fn.expansion)
+        
+        self.projection = projection
+        if self.projection:
+            self.projection_layer = nn.Sequential(
+                nn.Linear(feature_dim, feature_dim),
+                nn.ReLU(),
+                nn.Linear(feature_dim, 256)
+            )
+            self.classifier = nn.Linear(256, self.num_classes)
+        else:
+            self.classifier = nn.Linear(feature_dim, self.num_classes)
+
+        self._weight_initialization()
         self.save_activations = save_activations
         self.activations = None
 
-    def forward(self, x, start_layer_idx = 0):
+    def forward(self, x, start_layer_idx=0):
         if start_layer_idx >= 0:
             x = self.conv1(x)
             x = self.bn1(x)
@@ -1072,6 +1121,11 @@ class CifarResNet(ResNetBase):
             x = self.layer1(x)
             x = self.layer2(x)
             x = self.layer3(x)
+            
+            # --- 3. 修改：前向传播包含 Layer 4 ---
+            if self.has_layer4:
+                x = self.layer4(x)
+
             x = self.avgpool(x)
             x = x.view(x.size(0), -1)
             feature = x
@@ -1079,9 +1133,126 @@ class CifarResNet(ResNetBase):
                 feature = self.projection_layer(feature)
         else:
             feature = x
+        
         x = self.classifier(feature)
 
-        return F.normalize(feature, dim=1),x
+        return F.normalize(feature, dim=1), x
+
+# class CifarResNet(ResNetBase):
+#     def __init__(
+#         self,
+#         dataset,
+#         resnet_size,
+#         scaling=1,
+#         save_activations=False,
+#         group_norm_num_groups=None,
+#         freeze_bn=False,
+#         freeze_bn_affine=False,
+#         projection = False,
+#         is_meta = False
+#     ):
+#         super(CifarResNet, self).__init__()
+
+#         self.dataset = dataset
+#         self.freeze_bn = freeze_bn # 停止统计全局均值和方差：BN 层将不再维护和更新全局的 running_mean（滑动平均均值）和 running_var（滑动平均方差）。
+#         self.freeze_bn_affine = freeze_bn_affine
+#         track_running_stats = not self.freeze_bn # bn层的仿射变换是否有效
+
+#         # define model.
+#         if resnet_size % 6 != 2:
+#             raise ValueError("resnet_size must be 6n + 2:", resnet_size)
+#         block_nums = (resnet_size - 2) // 6
+#         block_fn = Bottleneck if resnet_size >= 44 else BasicBlock
+
+#         # if is_meta:
+#         #     block_fn = MetaBasicBlock
+
+#         # decide the num of classes.
+#         self.num_classes = self._decide_num_classes()
+
+#         # define layers.
+#         assert int(16 * scaling) > 0
+#         self.inplanes = int(16 * scaling) # 第一个残差块的输入通道
+#         self.conv1 = nn.Conv2d(
+#             in_channels=3,
+#             out_channels=(16 * scaling),
+#             kernel_size=3,
+#             stride=1,
+#             padding=1,
+#             bias=False,
+#         ) # 初始层
+#         self.bn1 = norm2d(group_norm_num_groups, planes=int(16 * scaling),track_running_stats=track_running_stats) # 组归一化
+#         self.relu = nn.ReLU(inplace=True)
+
+#         self.layer1 = self._make_block( # 构建block_nums个残差块，每个块两层卷积
+#             block_fn=block_fn,
+#             planes=int(16 * scaling),
+#             block_num=block_nums,
+#             group_norm_num_groups=group_norm_num_groups,
+#             track_running_stats=track_running_stats
+#         )
+#         self.layer2 = self._make_block(
+#             block_fn=block_fn,
+#             planes=int(32 * scaling),
+#             block_num=block_nums,
+#             stride=2,
+#             group_norm_num_groups=group_norm_num_groups,
+#             track_running_stats=track_running_stats
+#         )
+#         self.layer3 = self._make_block(
+#             block_fn=block_fn,
+#             planes=int(64 * scaling),
+#             block_num=block_nums,
+#             stride=2,
+#             group_norm_num_groups=group_norm_num_groups,
+#             track_running_stats=track_running_stats
+#         )
+
+#         self.avgpool = nn.AvgPool2d(kernel_size=8)
+#         feature_dim = int(64 * scaling * block_fn.expansion)
+#         self.projection = projection
+#         if self.projection: # 通常用于特征对齐，提升性能
+
+#             self.projection_layer = nn.Sequential(
+#                 nn.Linear(feature_dim,feature_dim),
+#                 nn.ReLU(),
+#                 nn.Linear(feature_dim,256)
+#             )
+#             self.classifier = nn.Linear(
+#                 in_features=256,
+#                 out_features=self.num_classes,
+#             )
+#         else:
+#             self.classifier = nn.Linear(
+#                 in_features=feature_dim,
+#                 out_features=self.num_classes,
+#             )
+#         # weight initialization based on layer type.
+#         self._weight_initialization()
+
+#         # a placeholder for activations in the intermediate layers.
+#         self.save_activations = save_activations
+#         self.activations = None
+
+#     def forward(self, x, start_layer_idx = 0):
+#         if start_layer_idx >= 0:
+#             x = self.conv1(x)
+#             x = self.bn1(x)
+#             x = self.relu(x)
+
+#             x = self.layer1(x)
+#             x = self.layer2(x)
+#             x = self.layer3(x)
+#             x = self.avgpool(x)
+#             x = x.view(x.size(0), -1)
+#             feature = x
+#             if self.projection:
+#                 feature = self.projection_layer(feature)
+#         else:
+#             feature = x
+#         x = self.classifier(feature)
+
+#         return F.normalize(feature, dim=1),x
 
 
 def hybrid_resnet18(ratio_LR=1, decom_rule=[1, 1], track=False, cfg=None):
@@ -1159,7 +1330,8 @@ def resnet(conf, arch=None):
                 group_norm_num_groups=conf.group_norm_num_groups,
                 projection=conf.projection,
                 save_activations = save_activations,
-                is_meta=conf.meta
+                is_meta=conf.meta,
+                scaling=conf.resnet_scaling
             )
     elif "imagenet" in dataset:
         if dataset == "tiny-imagenet" or dataset == "imagenet":

@@ -86,7 +86,7 @@ def get_args():
     parser.add_argument("--w_fc_bias", default=True, type=str2bool)
     parser.add_argument("--freeze_bn", default=False, type=str2bool)
     parser.add_argument("--freeze_bn_affine", default=False, type=str2bool)
-    parser.add_argument("--resnet_scaling", default=1, type=float)
+    parser.add_argument("--resnet_scaling", default=1, type=int)
     parser.add_argument("--vgg_scaling", default=None, type=int)
     parser.add_argument("--evonorm_version", default=None, type=str)
 
@@ -256,7 +256,7 @@ def get_args():
         conf.resnet.hidden_size = [64, 128, 256, 512]
     elif conf.arch == 'resnet8':
         conf.resnet = argparse.Namespace()
-        conf.resnet.hidden_size = [64, 128, 256]
+        conf.resnet.hidden_size = [16, 32, 64]
 
 
     return conf

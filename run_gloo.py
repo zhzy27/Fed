@@ -25,7 +25,7 @@ MethodTable = {
 
 def random_rank_creator(conf):
     # 定义候选的 rank 值
-    candidates = [1, 0.5, 0.25, 0.125]
+    candidates = [0.8]
     
     # 从候选列表中随机采样，size 指定生成数量
     # replace=True (默认) 表示允许重复选择同一个值
