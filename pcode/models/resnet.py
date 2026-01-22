@@ -71,33 +71,108 @@ class FactorizedConv(nn.Module):
     #     return loss
 
     # 在 FactorizedConv 类中
+    # def L2_loss(self):
+    #     # 获取两个分解层的权重
+    #     # conv[0] (V): shape [rank, in, 1, 3]
+    #     # conv[1] (U): shape [out, rank, 3, 1]
+    #     w_v = self.conv[0].weight 
+    #     w_u = self.conv[1].weight
+        
+    #     # 1. 处理 V (右矩阵) -> 变为 [rank, In*3]
+    #     # 展平: (rank, in, 1, 3) -> (rank, in * 3)
+    #     mat_v = w_v.view(w_v.shape[0], -1) 
+        
+    #     # 2. 处理 U (左矩阵) -> 变为 [Out*3, rank]
+    #     # 这里的变换必须是你 _decompose_layer 的逆过程
+    #     # 原始生成: U_prime.view(out, 3, rank).permute(0, 2, 1).unsqueeze(-1)
+    #     # 现在还原:
+    #     # [out, rank, 3, 1] -> squeeze -> [out, rank, 3]
+    #     # -> permute(0, 2, 1) -> [out, 3, rank]
+    #     # -> view -> [out*3, rank]
+    #     mat_u = w_u.squeeze(-1).permute(0, 2, 1).reshape(-1, w_u.shape[1])
+        
+    #     # 3. 虚拟矩阵乘法 (不改变模型结构，只计算值)
+    #     # [Out*3, rank] @ [rank, In*3] -> [Out*3, In*3]
+    #     w_rec = torch.matmul(mat_u, mat_v)
+        
+    #     # 4. 计算 L2 范数 (Frobenius Norm) 的平方
+    #     loss = (w_rec ** 2).sum()
+        
+    #     return loss
+    
+
     def L2_loss(self):
-        # 获取两个分解层的权重
+
+        # 1. Get weights
+
         # conv[0] (V): shape [rank, in, 1, 3]
+
         # conv[1] (U): shape [out, rank, 3, 1]
-        w_v = self.conv[0].weight 
+
+        w_v = self.conv[0].weight
+
         w_u = self.conv[1].weight
+
+
+
+        # 2. Process V (Right Matrix) to match `recover` logic for VT
+
+        # recover: conv1.weight.permute(1, 3, 2, 0) -> [in, 3, 1, rank]
+
+        # recover: reshape(in*3, rank) -> VT is [in*3, rank]
+
+        # recover: Uses VT.T -> [rank, in*3]
+
         
-        # 1. 处理 V (右矩阵) -> 变为 [rank, In*3]
-        # 展平: (rank, in, 1, 3) -> (rank, in * 3)
-        mat_v = w_v.view(w_v.shape[0], -1) 
+
+        # Mirroring 'recover' exactly:
+
+        # [rank, in, 1, 3] -> [in, 3, 1, rank]
+
+        v_permuted = w_v.permute(1, 3, 2, 0) 
+
+        # [in, 3, 1, rank] -> [in*3, rank]
+
+        vt_matrix = v_permuted.reshape(-1, w_v.shape[0]) 
+
+        # Transpose to get V used in W = U @ V
+
+        mat_v = vt_matrix.t() # Shape: [rank, in*3]
+
+
+
+        # 3. Process U (Left Matrix) to match `recover` logic for U
+
+        # recover: conv2.weight.permute(0, 2, 1, 3) -> [out, 3, rank, 1]
+
+        # recover: reshape(out*3, rank) -> U is [out*3, rank]
+
         
-        # 2. 处理 U (左矩阵) -> 变为 [Out*3, rank]
-        # 这里的变换必须是你 _decompose_layer 的逆过程
-        # 原始生成: U_prime.view(out, 3, rank).permute(0, 2, 1).unsqueeze(-1)
-        # 现在还原:
-        # [out, rank, 3, 1] -> squeeze -> [out, rank, 3]
-        # -> permute(0, 2, 1) -> [out, 3, rank]
-        # -> view -> [out*3, rank]
-        mat_u = w_u.squeeze(-1).permute(0, 2, 1).reshape(-1, w_u.shape[1])
-        
-        # 3. 虚拟矩阵乘法 (不改变模型结构，只计算值)
-        # [Out*3, rank] @ [rank, In*3] -> [Out*3, In*3]
+
+        # Mirroring 'recover' exactly:
+
+        # [out, rank, 3, 1] -> [out, 3, rank, 1]
+
+        u_permuted = w_u.permute(0, 2, 1, 3)
+
+        # [out, 3, rank, 1] -> [out*3, rank]
+
+        mat_u = u_permuted.reshape(-1, w_u.shape[1]) # Shape: [out*3, rank]
+
+
+
+        # 4. Virtual Matrix Multiplication (Reconstruction)
+
+        # [out*3, rank] @ [rank, in*3] -> [out*3, in*3]
+
         w_rec = torch.matmul(mat_u, mat_v)
-        
-        # 4. 计算 L2 范数 (Frobenius Norm) 的平方
+
+
+
+        # 5. Compute L2 Norm (Frobenius Norm) squared
+
         loss = (w_rec ** 2).sum()
-        
+
         return loss
 
     def kronecker_loss(self):
