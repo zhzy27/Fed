@@ -517,7 +517,15 @@ class MasterFedHM(object):
             if global_params[key].is_floating_point():
                 global_params[key] /= num_models
             else:
-                global_params[key] //= num_models
+                val_float = global_params[key].float() / num_models
+                # 2. 根据该参数原本的类型，决定如何赋值回去
+                if global_params[key].is_floating_point():
+                    # 如果原本就是浮点数 (如 weight, bias)，直接赋值
+                    global_params[key].copy_(val_float)
+                else:
+                    # 如果原本是整数 (如 num_batches_tracked)，需要四舍五入后转回整数
+                    # 使用 .round() 避免地板除的偏差，然后转为 .long()
+                    global_params[key].copy_(torch.round(val_float).long())
 
         # --- 第五步：构建返回的模型对象 ---
         # 我们深拷贝一个已经恢复结构的模型作为载体

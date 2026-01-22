@@ -360,6 +360,7 @@ class MetaBasicBlock(nn.Module):
         self.conv1.weight.data = W1
         self.conv2 = nn.Conv2d(self.outplanes, self.outplanes, kernel_size=3, stride=1, padding=1, bias=False)
         self.conv2.weight.data = W2
+        print("call recover")
 
     def frobenius_loss(self):
         loss1 = self.conv1.frobenius_loss()
