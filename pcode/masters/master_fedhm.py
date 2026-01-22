@@ -448,6 +448,126 @@ class MasterFedHM(object):
                     # 这里的 decom 内部会执行 SVD 并把 Conv2d 替换为 FactorizedConv
                     m.decom(current_rank)
             model.to('cpu')
+
+
+    # def recover_aggrevate(self, selected_client_ids):
+    #     # 1. 定义权重 (Origin逻辑: 默认为均匀平均)
+    #     n_selected_clients = len(selected_client_ids)
+    #     weights = [1.0 / n_selected_clients for _ in range(n_selected_clients)]
+
+    #     # 2. 将所有选中的客户端模型状态封装为 ModuleState 对象
+    #     # 这完全对应 Origin 代码中的 local_states = [ModuleState(...) for ...]
+    #     local_states = []
+    #     for client_id in selected_client_ids:
+    #         # Modified 版本中模型存储在 list 的元组里，取 [1]
+    #         local_model = self.client_models[client_id][1]
+    #         # 关键：使用 deepcopy 确保数据独立，防止引用修改
+    #         local_states.append(ModuleState(copy.deepcopy(local_model.state_dict())))
+
+    #     # 3. 执行加权聚合 (完全照搬 Origin 的数学逻辑)
+    #     # model_state = state[0] * w[0] + state[1] * w[1] + ...
+    #     model_state = local_states[0] * weights[0]
+        
+    #     for idx in range(1, len(local_states)):
+    #         model_state += local_states[idx] * weights[idx]
+
+    #     # 4. 将聚合后的状态复制回模型对象
+    #     # 取第一个客户端的模型作为结构底板 (template)
+    #     base_client_id = selected_client_ids[0]
+    #     aggregated_model = copy.deepcopy(self.client_models[base_client_id][1])
+        
+    #     # 使用 ModuleState 自带的 copy_to_module 方法
+    #     model_state.copy_to_module(aggregated_model)
+
+    #     return aggregated_model
+
+    # def recover_aggrevate(self, selected_client_ids):
+    #     """
+    #     1. 遍历 selected_client_ids 中的每个模型。
+    #     2. 找到模型中所有的 MetaBasicBlock，调用其 recover() 方法将其恢复为标准卷积。
+    #     3. 对恢复后的模型进行参数平均聚合。
+    #     4. 返回聚合后的新模型。
+    #     """
+        
+    #     # --- 第一步：恢复所有选中的模型 ---
+    #     # 注意：这里会直接修改 self.client_models 中存储的模型对象结构
+    #     for client_id in selected_client_ids:
+    #         # 获取模型对象 (记得取元组的第2个元素)
+    #         model = self.client_models[client_id][1]
+            
+    #         # 使用 modules() 递归遍历所有子模块，确保涵盖 body 和 personalized 中的所有块
+    #         # 这里的 MetaBasicBlock 需要确保你的代码环境中能访问到该类定义
+    #         for m in model.modules():
+    #             if isinstance(m, MetaBasicBlock):
+    #                 # 调用你提供的 recover 方法，它会将 FactorizedConv 替换回 Conv2d
+    #                 m.recover()
+
+    #     if not self.conf.train_fast:  # test all the selected_clients
+    #         for client_idx in selected_client_ids:
+    #             # _arch = self.clientid2arch[client_idx]
+    #             # _model_state_dict = copy.deepcopy(self.client_models[client_idx][1].state_dict())
+    #             # flatten_local_model.unpack(_model_state_dict.values())
+    #             # real_arch = _arch[1] if isinstance(_arch, tuple) else _arch
+    #             # _, test_model = create_model.define_model(self.conf, to_consistent_model=False, client_id=client_idx , arch=real_arch)
+    #             # test_model.load_state_dict(_model_state_dict)
+    #             test_model = copy.deepcopy(self.client_models[client_idx][1])
+    #             master_utils.do_validation(
+    #                 conf=self.conf,
+    #                 coordinator=self.local_coordinator[client_idx],
+    #                 model=test_model,
+    #                 criterion=self.criterion,
+    #                 metrics=self.metrics,
+    #                 data_loaders=self.test_loaders,
+    #                 label=f"aggregated_test_loader_{client_idx}",
+    #             )
+    #         self.additional_validation()
+    #     # --- 第二步：初始化聚合容器 ---
+    #     # 选取第一个模型作为聚合的“底板”
+    #     base_client_id = selected_client_ids[0]
+    #     base_model = self.client_models[base_client_id][1]
+        
+    #     # 深拷贝一份 state_dict 用于累加，避免修改原模型数据
+    #     global_params = copy.deepcopy(base_model.state_dict())
+        
+    #     # 将容器清零，准备累加
+    #     for key in global_params:
+    #         global_params[key].zero_()
+
+    #     # --- 第三步：累加所有模型的参数 ---
+    #     for client_id in selected_client_ids:
+    #         model = self.client_models[client_id][1]
+    #         local_params = model.state_dict()
+            
+    #         for key in global_params:
+    #             # 累加参数
+    #             # 注意：需保证所有模型在同一设备上 (CPU/GPU)
+    #             global_params[key] += local_params[key]
+
+    #     # --- 第四步：取平均 ---
+    #     num_models = len(selected_client_ids)
+    #     for key in global_params:
+    #         # 区分浮点数参数和整数参数 (如 BatchNorm 的 num_batches_tracked)
+    #         if global_params[key].is_floating_point():
+    #             global_params[key] /= num_models
+    #         else:
+    #             val_float = global_params[key].float() / num_models
+    #             # 2. 根据该参数原本的类型，决定如何赋值回去
+    #             if global_params[key].is_floating_point():
+    #                 # 如果原本就是浮点数 (如 weight, bias)，直接赋值
+    #                 global_params[key].copy_(val_float)
+    #             else:
+    #                 # 如果原本是整数 (如 num_batches_tracked)，需要四舍五入后转回整数
+    #                 # 使用 .round() 避免地板除的偏差，然后转为 .long()
+    #                 global_params[key].copy_(torch.round(val_float).long())
+
+    #     # --- 第五步：构建返回的模型对象 ---
+    #     # 我们深拷贝一个已经恢复结构的模型作为载体
+    #     aggregated_model = copy.deepcopy(base_model)
+    #     # 加载计算好的平均参数
+    #     aggregated_model.load_state_dict(global_params)
+
+    #     return aggregated_model
+
     def recover_aggrevate(self, selected_client_ids):
         """
         1. 遍历 selected_client_ids 中的每个模型。
@@ -458,6 +578,7 @@ class MasterFedHM(object):
         
         # --- 第一步：恢复所有选中的模型 ---
         # 注意：这里会直接修改 self.client_models 中存储的模型对象结构
+        # 这一步必须保留，确保聚合的是完整卷积核 W，而不是分解因子 U/V
         for client_id in selected_client_ids:
             # 获取模型对象 (记得取元组的第2个元素)
             model = self.client_models[client_id][1]
@@ -469,14 +590,10 @@ class MasterFedHM(object):
                     # 调用你提供的 recover 方法，它会将 FactorizedConv 替换回 Conv2d
                     m.recover()
 
+        # --- 中间步骤：验证逻辑 (保留不变) ---
         if not self.conf.train_fast:  # test all the selected_clients
             for client_idx in selected_client_ids:
-                # _arch = self.clientid2arch[client_idx]
-                # _model_state_dict = copy.deepcopy(self.client_models[client_idx][1].state_dict())
-                # flatten_local_model.unpack(_model_state_dict.values())
-                # real_arch = _arch[1] if isinstance(_arch, tuple) else _arch
-                # _, test_model = create_model.define_model(self.conf, to_consistent_model=False, client_id=client_idx , arch=real_arch)
-                # test_model.load_state_dict(_model_state_dict)
+                # 为了不破坏原模型，这里深拷贝一份用于测试
                 test_model = copy.deepcopy(self.client_models[client_idx][1])
                 master_utils.do_validation(
                     conf=self.conf,
@@ -488,50 +605,40 @@ class MasterFedHM(object):
                     label=f"aggregated_test_loader_{client_idx}",
                 )
             self.additional_validation()
-        # --- 第二步：初始化聚合容器 ---
-        # 选取第一个模型作为聚合的“底板”
-        base_client_id = selected_client_ids[0]
-        base_model = self.client_models[base_client_id][1]
-        
-        # 深拷贝一份 state_dict 用于累加，避免修改原模型数据
-        global_params = copy.deepcopy(base_model.state_dict())
-        
-        # 将容器清零，准备累加
-        for key in global_params:
-            global_params[key].zero_()
 
-        # --- 第三步：累加所有模型的参数 ---
+        # --- 第二步：聚合逻辑 (替换为 ModuleState 方式) ---
+        
+        # 1. 定义权重 (Origin逻辑: 默认为均匀平均)
+        n_selected_clients = len(selected_client_ids)
+        weights = [1.0 / n_selected_clients for _ in range(n_selected_clients)]
+
+        # 2. 将所有选中的客户端模型状态封装为 ModuleState 对象
+        # 这完全对应 Origin 代码中的 local_states = [ModuleState(...) for ...]
+        local_states = []
         for client_id in selected_client_ids:
-            model = self.client_models[client_id][1]
-            local_params = model.state_dict()
-            
-            for key in global_params:
-                # 累加参数
-                # 注意：需保证所有模型在同一设备上 (CPU/GPU)
-                global_params[key] += local_params[key]
+            # Modified 版本中模型存储在 list 的元组里，取 [1]
+            local_model = self.client_models[client_id][1]
+            # 关键：使用 deepcopy 确保数据独立，防止引用修改
+            # 注意：此时模型已经是 recover() 过的状态，所以提取的是完整的卷积参数
+            local_states.append(ModuleState(copy.deepcopy(local_model.state_dict())))
 
-        # --- 第四步：取平均 ---
-        num_models = len(selected_client_ids)
-        for key in global_params:
-            # 区分浮点数参数和整数参数 (如 BatchNorm 的 num_batches_tracked)
-            if global_params[key].is_floating_point():
-                global_params[key] /= num_models
-            else:
-                val_float = global_params[key].float() / num_models
-                # 2. 根据该参数原本的类型，决定如何赋值回去
-                if global_params[key].is_floating_point():
-                    # 如果原本就是浮点数 (如 weight, bias)，直接赋值
-                    global_params[key].copy_(val_float)
-                else:
-                    # 如果原本是整数 (如 num_batches_tracked)，需要四舍五入后转回整数
-                    # 使用 .round() 避免地板除的偏差，然后转为 .long()
-                    global_params[key].copy_(torch.round(val_float).long())
+        # 3. 执行加权聚合 (完全照搬 Origin 的数学逻辑)
+        # model_state = state[0] * w[0] + state[1] * w[1] + ...
+        # ModuleState 内部全精度浮点运算，避免了整数地板除的问题
+        model_state = local_states[0] * weights[0]
+        
+        for idx in range(1, len(local_states)):
+            model_state += local_states[idx] * weights[idx]
 
-        # --- 第五步：构建返回的模型对象 ---
-        # 我们深拷贝一个已经恢复结构的模型作为载体
-        aggregated_model = copy.deepcopy(base_model)
-        # 加载计算好的平均参数
-        aggregated_model.load_state_dict(global_params)
+        # 4. 将聚合后的状态复制回模型对象
+        # 取第一个客户端的模型作为结构底板 (template)
+        base_client_id = selected_client_ids[0]
+        # 注意：这里深拷贝的 base_model 已经是 recover 过的结构（标准卷积）
+        aggregated_model = copy.deepcopy(self.client_models[base_client_id][1])
+        
+        # 使用 ModuleState 自带的 copy_to_module 方法
+        # 它会自动处理类型转换 (float -> long) 和设备放置
+        model_state.copy_to_module(aggregated_model)
 
         return aggregated_model
 
