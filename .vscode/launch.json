@@ -196,15 +196,18 @@ python run_gloo.py \
     --manual_seed 7 \
     --pn_normalize True \
     --same_seed_process False \
-    --port 50022 \
+    --port 50012 \
     --train_fast True \
     --meta True \
     --decom_rule 0 1 \
     --ratio_LR 0.2 \
     --is_random_rank True \
-    --meta_L2 0.0002 \
+    --meta_L2 0 \
     --freeze_bn True
 
+
+
+    
 
 
     
@@ -346,6 +349,17 @@ python run_gloo.py \
     --port 50027 \
     --train_fast True \
     --resnet_scaling 4
+
+
+
+
+python run_gloo.py     --arch resnet18     --complex_arch master=resnet18,worker=resnet18     --method fedhm     --experiment demo     --group_norm_num_groups 16     --data cifar10     --pin_memory True     --batch_size 64     --num_workers 2     --distillation_coefficient 0     --projection 0     --partition_data random     --non_iid_alpha 0.5     --train_data_ratio 1     --val_data_ratio 0.1     --n_clients 20     --participation_ratio 0.2     --n_comm_rounds 300     --local_n_epochs 30     --world_conf 0,7,1,1,100     --on_cuda True     --optimizer sgd     --lr 0.05     --local_prox_term 0     --lr_warmup False     --lr_warmup_epochs 5     --lr_warmup_epochs_upper_bound 150     --lr_scheduler MultiStepLR     --lr_decay 0.1     --weight_decay 0     --use_nesterov False     --momentum_factor 0.9     --track_time True     --display_tracked_time True     --python_path /data_B/inspur/anaconda3/envs/zyz_fedgkd/bin/python     --hostfile hostfile     --manual_seed 7     --pn_normalize True     --same_seed_process False     --port 50012     --train_fast True     --meta True     --decom_rule 0 1     --ratio_LR 0.2     --is_random_rank True     --meta_L2 0     --freeze_bn True
+runtime: {'time': '2026-01-24 05:55:18', 'comm_round': 300, 'loss': 0.7398963506937027, 'top1': 90.41, 'loss2': 0.0} ({'split': 'test', 'type': 'aggregated_test_loader_0-0'})
+2026-01-24 05:55:18     The validation performance = {'loss': 0.7398963506937027, 'top1': 90.41, 'loss2': 0.0}.
+2026-01-24 05:55:18     Best performance of loss             (best comm_round 86.000, current comm_round 300.000): 0.5717480360907968.
+2026-01-24 05:55:18     Best performance of top1             (best comm_round 278.000, current comm_round 300.000): 90.56.
+2026-01-24 05:55:18     Best performance of loss2             (best comm_round 1.000, current comm_round 300.000): 0.0.
+
 */
 
 
