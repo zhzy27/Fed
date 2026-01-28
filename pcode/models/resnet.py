@@ -405,1142 +405,400 @@ class MetaBasicBlock(nn.Module):
         return out
 
 
+
+
 class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有两个残差块 每个残差块包括两个3x3的卷积
 
-
-
     def __init__(self, data_shape, hidden_size, block, num_blocks, ratio_LR, decom_rule, num_classes=10,
-
-                 rate=1, track=None, cfg=None, dropout_rate=0, group_norm_num_groups = None ,feature_align_dim=0):
-
+                 rate=1, track=None, cfg=None, dropout_rate=0, group_norm_num_groups = None):
         super(HyperResNet, self).__init__()
-
         """
-
         decom_rule is a 2-tuple like (block_index, layer_index).
-
         For resnet18, block_index is selected from [0,1,2,3] and layer_index is selected from [0,1].
-
-        Example: If we only want to decompose layers starting form the 8-th layer for resnet18,
-
+        Example: If we only want to decompose layers starting form the 8-th layer for resnet18, 
                  then we set decom_rule = (1, 1);
-
-                 If we want to decompose all layer(expept head and tail layer), we can set
-
+                 If we want to decompose all layer(expept head and tail layer), we can set 
                  decom_rule = (-1, 0);
-
-                 If we don't want to decompose any layer, we can set
-
+                 If we don't want to decompose any layer, we can set 
                  decom_rule = (4, 0).
-
         """
-
         self.cfg = cfg
-
         self.dataset_name = cfg.data
-
         self.decom_rule = decom_rule # [0,0] 表示从第零个阶段的第零个残差块开始分解
-
         self.group_norm_num_groups = group_norm_num_groups
-
         self.inplanes = hidden_size[0] # 动态记录当前卷积输出通道，初始化为64
-
         self.hidden_size = hidden_size # 四个阶段的输出通道数量
-
         self.num_blocks = num_blocks    # 每个resnet阶段的残差块数量
-
         self.dropout_rate = dropout_rate # 随机失活率 这里为0
-
         self.feature_num = hidden_size[-1] # 最终层的输入 ？？？
-
         self.class_num = num_classes        # 10
-
         self.ratio_LR = ratio_LR            # 分解率
 
-
-
         self.head = nn.Sequential(
-
             nn.Conv2d(data_shape[0], self.inplanes, kernel_size=3, stride=1, padding=1, bias=False),
-
             # nn.BatchNorm2d(64, momentum=None, track_running_stats=None),
-
             norm2d(group_norm_num_groups, planes=self.inplanes, track_running_stats=False),
-
-           
-
+            
         ) # 卷积层，输出对应上初始输出通道，这个应该初始层
-
         self.relu = nn.ReLU(inplace=True) # 一种内存优化手段
 
-
-
         # initialization the hybrid model
-
         strides = [1, 2, 2, 2]
-
         all_layers, common_layers, personalized_layers = [], [], []
-
         common_layers.append(self.head)
-
         for block_idx in range(len(hidden_size)):
-
             if block_idx < self.decom_rule[0]: # 看该阶段（块）是否需要分解
-
                 layer = self._make_larger_layer(block=block, planes=hidden_size[block_idx],
-
                                                 blocks=num_blocks[block_idx],
-
                                                 stride=strides[block_idx], rate=rate, track=track)
-
                 all_layers.append(layer)
-
                 common_layers.append(layer)
-
             elif block_idx == self.decom_rule[0]: # 这个就是混合阶段（可能会第一块分解，第二块不分解，所以单独处理）
-
                 config = round(hidden_size[block_idx] * self.ratio_LR)  # rank 第一块输出为64 ， 64*0.2=13
-
                 layer = self._make_hybrid_layer(large_block=block, meta_block=MetaBasicBlock,
-
                                                 planes=hidden_size[block_idx],
-
                                                 blocks=num_blocks[block_idx], stride=strides[block_idx],
-
                                                 start_decom_idx=self.decom_rule[1], config=config,
-
                                                 rate=rate, track=track, )
-
                 all_layers.append(layer)
-
                 for layer_idx in range(self.decom_rule[1]): # 未分解的层视为公共层
-
                     common_layers.append(layer[layer_idx])
-
                 for layer_idx in range(self.decom_rule[1], self.num_blocks[block_idx]): # 分解的层视为个性化层
-
                     personalized_layers.append(layer[layer_idx])
 
-
-
             elif block_idx > self.decom_rule[0]:
-
                 config = round(hidden_size[block_idx] * self.ratio_LR)  # rank
-
                 layer = self._make_meta_layer(block=MetaBasicBlock, planes=hidden_size[block_idx],
-
                                               blocks=num_blocks[block_idx],
-
                                               config=config, stride=strides[block_idx], rate=rate, track=track)
-
                 all_layers.append(layer)
-
                 personalized_layers.append(layer)
 
-
-
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1)) # 池化层，这里的全局池化替代了展平操作，即每个通道只取一个
-
         self.tail = nn.Linear(self.feature_num, num_classes) # 全连接层输出
-
         personalized_layers.append(self.tail) # 这个也算个性化层，但是未进行分解
 
-
-
         self.body = nn.Sequential(*all_layers) # 将列表变为网络层
-
         self.common = nn.Sequential(*common_layers)
-
         self.personalized = nn.Sequential(*personalized_layers) # 共六层，第一个阶段被拆为了两个层，后面三个阶段未拆，线性层不分解
 
-
-
+        self.use_align = False
         self.feature_align_dim = 0
 
-
-
         if cfg.output_dim is not None:
-
-            feature_align_dim = cfg.output_dim
-
-
+            self.feature_align_dim = cfg.output_dim
 
         self.block_channels=[]
-
-       
-
-        if feature_align_dim != 0:
-
-            self.feature_align_dim = feature_align_dim
-
-            for stage_idx, channels in enumerate(hidden_size):
-
-                for _ in range(num_blocks[stage_idx]):
-
-                    self.block_channels.append(channels)
-
-            print(self.block_channels)
-
-
-
-            self.total_blocks_num = len(self.block_channels)
-
+        
+        self.use_align = False
+        self.feature_align_dim = 0
+        
+        # 1. 判断是否开启对齐 (仅依赖 cfg.output_dim)
+        if self.cfg.output_dim is not None:
+            self.use_align = True
+            self.feature_align_dim = self.cfg.output_dim
+            
+            # 2. 为每个阶段构建一个 Aligner
+            # self.hidden_size 是 [64, 128, 256, 512]，正好对应4个阶段的输出通道
             self.aligners = nn.ModuleList([
-
                 nn.Sequential(
-
                     nn.AdaptiveAvgPool2d((1, 1)),
-
                     nn.Flatten(),
-
-                    nn.Linear(c, feature_align_dim),
-
-                    nn.ReLU(inplace=True) # 可选：加个激活函数增加非线性
-
-                ) for c in self.block_channels
-
+                    nn.Linear(channels, self.feature_align_dim),
+                    # nn.ReLU(inplace=True) # 建议：如果做特征对齐，通常最后一层不加ReLU，以便允许负值，或者加归一化
+                ) for channels in self.hidden_size
             ])
+            
+            print(f"Alignment enabled. 4 Aligners created for channels: {self.hidden_size} -> {self.feature_align_dim}")
 
-
-
-            self.fusion_weights = nn.Parameter(torch.ones(self.total_blocks_num) / self.total_blocks_num)  # 这里权重设为可学习权重
-
-
-
-
-
+            # self.fusion_weights = nn.Parameter(torch.ones(self.total_blocks_num) / self.total_blocks_num)  # 这里权重设为可学习权重
 
 
 
 
         # initialization for the hybrid model parameters
-
         for m in self.modules():
-
             if isinstance(m, nn.Conv2d):
-
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-
-                m.weight.data.fill_(1)
-
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)): 
+                m.weight.data.fill_(1) 
                 m.bias.data.zero_()
 
-
-
     def _make_meta_layer(self, block, planes, blocks, config=None, stride=1, rate=1, track=None):
-
         cfg = self.cfg
-
         downsample = None
-
         if stride != 1 or self.inplanes != planes * block.expansion:
-
             downsample = nn.Sequential(
-
                 nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-
                 # nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
-
                 norm2d(self.group_norm_num_groups, planes=planes * block.expansion, track_running_stats=False),
-
             )
 
-
-
         layers = []
-
-
 
         layers.append(block(self.inplanes, planes, stride=stride, n_basis=config, downsample=downsample, group_norm_num_groups=self.group_norm_num_groups,
-
                             dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg))
 
-
-
         self.inplanes = planes * block.expansion
-
         for i in range(1, blocks):
-
             layers.append(
-
                 block(self.inplanes, planes, stride=1, n_basis=config, dropout_rate=self.dropout_rate, rate=rate,group_norm_num_groups=self.group_norm_num_groups,
-
                       track=track, cfg=cfg))
-
         return nn.Sequential(*layers)
-
-
 
     def _make_hybrid_layer(self, large_block, meta_block, planes, blocks, stride=1, rate=1, start_decom_idx=0,
-
                            config=1, track=None):
-
         """
-
         :param start_decom_idx: range from [0, blocks-1]
-
         """
-
         cfg = self.cfg
-
         downsample = None
-
         block = meta_block if start_decom_idx == 0 else large_block # 看第一块是否为要分解的块
 
-
-
         if stride != 1 or self.inplanes != planes * block.expansion:  # 残差对齐，按stride下采样保证大小相同，用1x1卷积对齐通道数，这里暂时还没用上
-
             downsample = nn.Sequential(
-
                 nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-
                 # nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
-
                 norm2d(self.group_norm_num_groups, planes=planes * block.expansion, track_running_stats=False)
-
             )
-
         layers = []
-
         if start_decom_idx == 0:
-
             block = meta_block # 这又写重叠了,其中meta_block是分解后的残差块（即两层卷积的分解）
-
             layers.append(
-
                 block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate,group_norm_num_groups=self.group_norm_num_groups,
-
                       n_basis=config, track=track, cfg=cfg)) # 这里面要不是分解地两层卷积层，要不是未分解地
-
         else:
-
             block = large_block
-
             layers.append(
-
                 block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate,group_norm_num_groups=self.group_norm_num_groups,
-
                       track=track, cfg=cfg))
-
         self.inplanes = planes * block.expansion # 保证维度一致
 
-
-
         for idx in range(1, blocks): # 就剩下一个块，有必要写循环吗
-
             block = large_block if idx < start_decom_idx else meta_block # 和下面代码功能重复
-
             if idx < start_decom_idx:
-
                 block = large_block
-
                 layers.append(
-
                     block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg,group_norm_num_groups=self.group_norm_num_groups,))
-
             else:
-
                 block = meta_block
-
                 layers.append(
-
                     block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, n_basis=config, track=track,group_norm_num_groups=self.group_norm_num_groups,
-
                           cfg=cfg))
 
-
-
         return nn.Sequential(*layers)
-
-
-
 
 
     def _make_larger_layer(self, block, planes, blocks, stride=1, rate=1, track=None):
-
         cfg = self.cfg
-
         downsample = None
-
         if stride != 1 or self.inplanes != planes * block.expansion:
-
             downsample = nn.Sequential(
-
                 nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-
                 # nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
-
                 norm2d(self.group_norm_num_groups, planes=planes * block.expansion, track_running_stats=False),
-
             )
-
         layers = []
-
         layers.append(
-
             block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate, group_norm_num_groups=self.group_norm_num_groups,
-
                   track=track, cfg=cfg))
-
         self.inplanes = planes * block.expansion
-
         for _ in range(1, blocks):
-
             layers.append(
-
                 block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg, group_norm_num_groups=self.group_norm_num_groups,))
-
-
 
         return nn.Sequential(*layers)
 
 
-
-
-
     def recover_large_layer(self, ):
-
         length = len(self.personalized)
-
         for idx, block in enumerate(self.personalized):
-
             # the last part of self.personalized is linear layer which is not decomposed
-
             if idx < length - 1:
-
                 if isinstance(block, MetaBasicBlock):
-
                     block.recover()
-
                 else:
-
                     for j in range(len(block)):
-
                         block[j].recover()
 
 
-
-
-
     def decom_large_layer(self, ratio_LR=0.2):
-
         length = len(self.personalized)
-
         for idx, block in enumerate(self.personalized):
-
             # the last part of self.personalized is linear layer which is not decomposed
-
             if idx < length - 1:
-
                 if isinstance(block, MetaBasicBlock):
-
                     block.decom(ratio_LR=ratio_LR)
-
                 else:
-
                     for j in range(len(block)):
-
                         block[j].decom(ratio_LR=ratio_LR)
 
 
-
-
-
     def frobenius_decay(self):
-
         loss = torch.tensor(0.).to(self.cfg['device'])
-
         length = len(self.personalized)
-
         for idx, block in enumerate(self.personalized):
-
             # the last part of self.personalized is linear layer which is not decomposed
-
             if idx < length - 1:
-
                 if isinstance(block, MetaBasicBlock):
-
                     loss += block.frobenius_loss()
-
                 else:
-
                     for j in range(len(block)):
-
                         loss += block[j].frobenius_loss()
-
         return loss
-
-
-
 
 
     def kronecker_decay(self):
-
         loss = torch.tensor(0.).to(self.cfg['device'])
-
         length = len(self.personalized)
-
         for idx, block in enumerate(self.personalized):
-
             # the last part of self.personalized is linear layer which is not decomposed
-
             if idx < length - 1:
-
                 if isinstance(block, MetaBasicBlock):
-
                     loss += block.kronecker_loss()
-
                 else:
-
                     for j in range(len(block)):
-
                         loss += block[j].kronecker_loss()
-
         return loss
-
-
-
 
 
     # def L2_decay(self):
-
     #     loss = torch.tensor(0.).to(self.cfg.device)
-
     #     length = len(self.personalized)
-
     #     for idx, block in enumerate(self.personalized):
-
     #         # the last part of self.personalized is linear layer which is not decomposed
-
     #         if idx < length - 1:
-
     #             if isinstance(block, MetaBasicBlock):
-
     #                 loss += block.L2_loss()
-
     #             else:
-
     #                 for j in range(len(block)):
-
     #                     loss += block[j].L2_loss()
-
     #     return loss
 
-
-
     def L2_decay(self):
-
         loss = torch.tensor(0.).to(self.cfg.device if self.cfg else 'cuda')
 
-
-
         # 定义一个内部函数来递归处理各种层
-
         def add_l2_loss(module):
-
             local_loss = torch.tensor(0.).to(loss.device)
-
-           
-
+            
             # 情况1: 如果模块有自定义的 L2_loss 方法 (例如 MetaBasicBlock)，优先使用它
-
             if hasattr(module, 'L2_loss'):
-
                 local_loss += module.L2_loss()
-
-               
-
+                
             # 情况2: 如果是基础的带权层 (Conv2d, Linear)，且没有被自定义方法处理过
-
             # 注意: MetaBasicBlock 也有 Conv2d，但上面的 hasattr 会拦截它，防止重复计算
-
             elif isinstance(module, (nn.Conv2d, nn.Linear)):
-
                 # 只对 weight 做衰减，通常不对 bias 做 L2 (这也是 PyTorch optim 的默认行为之一，虽然 strict WD 会包含)
-
                 if module.weight.requires_grad:
-
                     local_loss += torch.sum(module.weight ** 2)
-
-                   
-
+                    
             # 情况3: 如果是容器 (Sequential, ModuleList, 或普通的 BasicBlock)，递归处理子模块
-
             else:
-
                 for child in module.children():
-
                     local_loss += add_l2_loss(child)
-
-                   
-
+                    
             return local_loss
 
-
-
         # ------------------------------------------------------
-
         # 遍历模型的两个主要部分：Common (前半截) 和 Personalized (后半截)
-
         # ------------------------------------------------------
-
-       
-
+        
         # 1. 处理 Common 层 (包含 Head 和 前期全秩 Blocks)
-
         # self.common 是一个 nn.Sequential
-
         loss += add_l2_loss(self.common)
 
-
-
         # 2. 处理 Personalized 层 (包含 Meta Blocks, 后期 Blocks 和 Tail)
-
         # self.personalized 也是一个 nn.Sequential
-
         loss += add_l2_loss(self.personalized)
-
-
 
         return loss
 
 
-
-
-
     def cal_smallest_svdvals(self): # 计算奇异值最小值，论证论文中的理论部分，分解后的奇异值有下界
-
         """
-
         calculate the smallest singular value of each residual block.
-
         For example, if the model is resnet18, then there are 8 residual blocks.
-
         """
-
         smallest_svdvals = []
-
         length = len(self.personalized)
-
         for idx, block in enumerate(self.personalized):
-
             # the last part of self.personalized is linear layer which is not decomposed
-
             if idx < length - 1:
-
                 if isinstance(block, MetaBasicBlock):
-
                     smallest_svdvals.append(block.cal_smallest_svdvals())
-
                 else:
-
                     for j in range(len(block)):
-
                         smallest_svdvals.append(block[j].cal_smallest_svdvals())
-
         return smallest_svdvals
 
 
+    def calculate_stage_anchor_loss(self, anchors):
+        """
+        计算内部存储的 4 个阶段特征与传入的 4 个锚点的 MSE 损失。
+        
+        Args:
+            anchors (list or tensor): 4 个锚点。
+        """
+        # 检查是否有特征 (防止 use_align=False 时调用报错)
+        if not self.use_align or len(self.stage_features) == 0:
+            return torch.tensor([0., 0., 0., 0.], device=self.parameters().__next__().device)
 
+        losses = []
+        
+        for i in range(4):
+            # [关键修改 4] 直接从 self 读取
+            feat = self.stage_features[i] 
+            anchor = anchors[i]
+            
+            # 1. Feature 归一化
+            feat_norm = F.normalize(feat, p=2, dim=1)
+            
+            # 2. Anchor 归一化 (处理 tensor 类型)
+            if isinstance(anchor, torch.Tensor):
+                anchor = anchor.to(feat.device) 
+                anchor_norm = F.normalize(anchor, p=2, dim=-1)
+            else:
+                # 如果 anchor 已经是 list 里的 tensor 且已归一化，直接用
+                anchor_norm = anchor
 
+            # 3. 计算 MSE
+            loss = F.mse_loss(feat_norm, anchor_norm.detach())
+            losses.append(loss)
+            
+        return torch.stack(losses)
 
     def forward(self, x):
-
         x = self.head(x)
-
         x = self.relu(x)
-
-
-
+        self.stage_features = []
         # for idx, layer in enumerate(self.body):
-
         #     x = layer(x)
 
-
-
         # x = self.avgpool(x)
-
         # x = x.view(x.size(0), -1)
-
         # feature = x
-
         # x = self.tail(x)
-
         # return feature,x
 
+        for i, stage_layer in enumerate(self.body):
+            x = stage_layer(x)
+            
+            # [关键修改 2] 如果开启对齐，计算特征并存入 self.stage_features
+            if self.use_align:
+                # x: [B, C, H, W] -> aligner -> [B, align_dim]
+                aligned_feat = self.aligners[i](x)
+                self.stage_features.append(aligned_feat)
 
-
-        if self.feature_align_dim == 0:
-
-            for layer in self.body:
-
-                x = layer(x)
-
-           
-
-            # 直接做分类
-
-            x = self.avgpool(x)
-
-            x = x.view(x.size(0), -1)
-
-            logits = self.tail(x)
-
-           
-
-            # 返回空或者仅返回 logits
-
-            return x, logits
-
-       
-
-
-
-        collected_features = []
-
-        block_counter = 0
-
-
-
-        for stage in self.body:
-
-            for block in stage:
-
-                x = block(x)
-
-               
-
-                aligner = self.aligners[block_counter]
-
-                feat = aligner(x)
-
-                collected_features.append(feat)
-
-               
-
-                block_counter += 1
-
-
-
-        # [计算开销点] 融合计算
-
-        stacked_features = torch.stack(collected_features, dim=1)
-
-        normalized_weights = F.softmax(self.fusion_weights, dim=0)
-
-        weights_view = normalized_weights.view(1, -1, 1)
-
-        fused_feature = torch.sum(stacked_features * weights_view, dim=1)
-
-
-
-        # 分类部分
-
+        # 最后的分类头
         x = self.avgpool(x)
-
         x = x.view(x.size(0), -1)
-
+        # pooled_feature = x # 如果外面需要用到池化后的特征，可以留着
         logits = self.tail(x)
 
-
-
-        return fused_feature, logits
-
-# class HyperResNet(nn.Module): # resnet-18 可分为4个阶段，每个阶段有两个残差块 每个残差块包括两个3x3的卷积
-
-#     def __init__(self, data_shape, hidden_size, block, num_blocks, ratio_LR, decom_rule, num_classes=10,
-#                  rate=1, track=None, cfg=None, dropout_rate=0, group_norm_num_groups = None):
-#         super(HyperResNet, self).__init__()
-#         """
-#         decom_rule is a 2-tuple like (block_index, layer_index).
-#         For resnet18, block_index is selected from [0,1,2,3] and layer_index is selected from [0,1].
-#         Example: If we only want to decompose layers starting form the 8-th layer for resnet18, 
-#                  then we set decom_rule = (1, 1);
-#                  If we want to decompose all layer(expept head and tail layer), we can set 
-#                  decom_rule = (-1, 0);
-#                  If we don't want to decompose any layer, we can set 
-#                  decom_rule = (4, 0).
-#         """
-#         self.cfg = cfg
-#         self.dataset_name = cfg.data
-#         self.decom_rule = decom_rule # [0,0] 表示从第零个阶段的第零个残差块开始分解
-#         self.group_norm_num_groups = group_norm_num_groups
-#         self.inplanes = hidden_size[0] # 动态记录当前卷积输出通道，初始化为64
-#         self.hidden_size = hidden_size # 四个阶段的输出通道数量
-#         self.num_blocks = num_blocks    # 每个resnet阶段的残差块数量
-#         self.dropout_rate = dropout_rate # 随机失活率 这里为0
-#         self.feature_num = hidden_size[-1] # 最终层的输入 ？？？
-#         self.class_num = num_classes        # 10
-#         self.ratio_LR = ratio_LR            # 分解率
-
-#         self.head = nn.Sequential(
-#             nn.Conv2d(data_shape[0], self.inplanes, kernel_size=3, stride=1, padding=1, bias=False),
-#             # nn.BatchNorm2d(64, momentum=None, track_running_stats=None),
-#             norm2d(group_norm_num_groups, planes=self.inplanes, track_running_stats=False),
-            
-#         ) # 卷积层，输出对应上初始输出通道，这个应该初始层
-#         self.relu = nn.ReLU(inplace=True) # 一种内存优化手段
-
-#         # initialization the hybrid model
-#         strides = [1, 2, 2, 2]
-#         all_layers, common_layers, personalized_layers = [], [], []
-#         common_layers.append(self.head)
-#         for block_idx in range(len(hidden_size)):
-#             if block_idx < self.decom_rule[0]: # 看该阶段（块）是否需要分解
-#                 layer = self._make_larger_layer(block=block, planes=hidden_size[block_idx],
-#                                                 blocks=num_blocks[block_idx],
-#                                                 stride=strides[block_idx], rate=rate, track=track)
-#                 all_layers.append(layer)
-#                 common_layers.append(layer)
-#             elif block_idx == self.decom_rule[0]: # 这个就是混合阶段（可能会第一块分解，第二块不分解，所以单独处理）
-#                 config = round(hidden_size[block_idx] * self.ratio_LR)  # rank 第一块输出为64 ， 64*0.2=13
-#                 layer = self._make_hybrid_layer(large_block=block, meta_block=MetaBasicBlock,
-#                                                 planes=hidden_size[block_idx],
-#                                                 blocks=num_blocks[block_idx], stride=strides[block_idx],
-#                                                 start_decom_idx=self.decom_rule[1], config=config,
-#                                                 rate=rate, track=track, )
-#                 all_layers.append(layer)
-#                 for layer_idx in range(self.decom_rule[1]): # 未分解的层视为公共层
-#                     common_layers.append(layer[layer_idx])
-#                 for layer_idx in range(self.decom_rule[1], self.num_blocks[block_idx]): # 分解的层视为个性化层
-#                     personalized_layers.append(layer[layer_idx])
-
-#             elif block_idx > self.decom_rule[0]:
-#                 config = round(hidden_size[block_idx] * self.ratio_LR)  # rank
-#                 layer = self._make_meta_layer(block=MetaBasicBlock, planes=hidden_size[block_idx],
-#                                               blocks=num_blocks[block_idx],
-#                                               config=config, stride=strides[block_idx], rate=rate, track=track)
-#                 all_layers.append(layer)
-#                 personalized_layers.append(layer)
-
-#         self.avgpool = nn.AdaptiveAvgPool2d((1, 1)) # 池化层，这里的全局池化替代了展平操作，即每个通道只取一个
-#         self.tail = nn.Linear(self.feature_num, num_classes) # 全连接层输出
-#         personalized_layers.append(self.tail) # 这个也算个性化层，但是未进行分解
-
-#         self.body = nn.Sequential(*all_layers) # 将列表变为网络层
-#         self.common = nn.Sequential(*common_layers)
-#         self.personalized = nn.Sequential(*personalized_layers) # 共六层，第一个阶段被拆为了两个层，后面三个阶段未拆，线性层不分解
-
-#         self.use_align = False
-#         self.feature_align_dim = 0
-
-#         if cfg.output_dim is not None:
-#             self.feature_align_dim = cfg.output_dim
-
-#         self.block_channels=[]
-        
-#         self.use_align = False
-#         self.feature_align_dim = 0
-        
-#         # 1. 判断是否开启对齐 (仅依赖 cfg.output_dim)
-#         if self.cfg.output_dim is not None:
-#             self.use_align = True
-#             self.feature_align_dim = self.cfg.output_dim
-            
-#             # 2. 为每个阶段构建一个 Aligner
-#             # self.hidden_size 是 [64, 128, 256, 512]，正好对应4个阶段的输出通道
-#             self.aligners = nn.ModuleList([
-#                 nn.Sequential(
-#                     nn.AdaptiveAvgPool2d((1, 1)),
-#                     nn.Flatten(),
-#                     nn.Linear(channels, self.feature_align_dim),
-#                     # nn.ReLU(inplace=True) # 建议：如果做特征对齐，通常最后一层不加ReLU，以便允许负值，或者加归一化
-#                 ) for channels in self.hidden_size
-#             ])
-            
-#             print(f"Alignment enabled. 4 Aligners created for channels: {self.hidden_size} -> {self.feature_align_dim}")
-
-#             # self.fusion_weights = nn.Parameter(torch.ones(self.total_blocks_num) / self.total_blocks_num)  # 这里权重设为可学习权重
-
-
-
-
-#         # initialization for the hybrid model parameters
-#         for m in self.modules():
-#             if isinstance(m, nn.Conv2d):
-#                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-#             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)): 
-#                 m.weight.data.fill_(1) 
-#                 m.bias.data.zero_()
-
-#     def _make_meta_layer(self, block, planes, blocks, config=None, stride=1, rate=1, track=None):
-#         cfg = self.cfg
-#         downsample = None
-#         if stride != 1 or self.inplanes != planes * block.expansion:
-#             downsample = nn.Sequential(
-#                 nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-#                 # nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
-#                 norm2d(self.group_norm_num_groups, planes=planes * block.expansion, track_running_stats=False),
-#             )
-
-#         layers = []
-
-#         layers.append(block(self.inplanes, planes, stride=stride, n_basis=config, downsample=downsample, group_norm_num_groups=self.group_norm_num_groups,
-#                             dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg))
-
-#         self.inplanes = planes * block.expansion
-#         for i in range(1, blocks):
-#             layers.append(
-#                 block(self.inplanes, planes, stride=1, n_basis=config, dropout_rate=self.dropout_rate, rate=rate,group_norm_num_groups=self.group_norm_num_groups,
-#                       track=track, cfg=cfg))
-#         return nn.Sequential(*layers)
-
-#     def _make_hybrid_layer(self, large_block, meta_block, planes, blocks, stride=1, rate=1, start_decom_idx=0,
-#                            config=1, track=None):
-#         """
-#         :param start_decom_idx: range from [0, blocks-1]
-#         """
-#         cfg = self.cfg
-#         downsample = None
-#         block = meta_block if start_decom_idx == 0 else large_block # 看第一块是否为要分解的块
-
-#         if stride != 1 or self.inplanes != planes * block.expansion:  # 残差对齐，按stride下采样保证大小相同，用1x1卷积对齐通道数，这里暂时还没用上
-#             downsample = nn.Sequential(
-#                 nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-#                 # nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
-#                 norm2d(self.group_norm_num_groups, planes=planes * block.expansion, track_running_stats=False)
-#             )
-#         layers = []
-#         if start_decom_idx == 0:
-#             block = meta_block # 这又写重叠了,其中meta_block是分解后的残差块（即两层卷积的分解）
-#             layers.append(
-#                 block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate,group_norm_num_groups=self.group_norm_num_groups,
-#                       n_basis=config, track=track, cfg=cfg)) # 这里面要不是分解地两层卷积层，要不是未分解地
-#         else:
-#             block = large_block
-#             layers.append(
-#                 block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate,group_norm_num_groups=self.group_norm_num_groups,
-#                       track=track, cfg=cfg))
-#         self.inplanes = planes * block.expansion # 保证维度一致
-
-#         for idx in range(1, blocks): # 就剩下一个块，有必要写循环吗
-#             block = large_block if idx < start_decom_idx else meta_block # 和下面代码功能重复
-#             if idx < start_decom_idx:
-#                 block = large_block
-#                 layers.append(
-#                     block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg,group_norm_num_groups=self.group_norm_num_groups,))
-#             else:
-#                 block = meta_block
-#                 layers.append(
-#                     block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, n_basis=config, track=track,group_norm_num_groups=self.group_norm_num_groups,
-#                           cfg=cfg))
-
-#         return nn.Sequential(*layers)
-
-
-#     def _make_larger_layer(self, block, planes, blocks, stride=1, rate=1, track=None):
-#         cfg = self.cfg
-#         downsample = None
-#         if stride != 1 or self.inplanes != planes * block.expansion:
-#             downsample = nn.Sequential(
-#                 nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-#                 # nn.BatchNorm2d(planes * block.expansion, momentum=0.0, track_running_stats=track)
-#                 norm2d(self.group_norm_num_groups, planes=planes * block.expansion, track_running_stats=False),
-#             )
-#         layers = []
-#         layers.append(
-#             block(self.inplanes, planes, stride, downsample=downsample, dropout_rate=self.dropout_rate, rate=rate, group_norm_num_groups=self.group_norm_num_groups,
-#                   track=track, cfg=cfg))
-#         self.inplanes = planes * block.expansion
-#         for _ in range(1, blocks):
-#             layers.append(
-#                 block(self.inplanes, planes, dropout_rate=self.dropout_rate, rate=rate, track=track, cfg=cfg, group_norm_num_groups=self.group_norm_num_groups,))
-
-#         return nn.Sequential(*layers)
-
-
-#     def recover_large_layer(self, ):
-#         length = len(self.personalized)
-#         for idx, block in enumerate(self.personalized):
-#             # the last part of self.personalized is linear layer which is not decomposed
-#             if idx < length - 1:
-#                 if isinstance(block, MetaBasicBlock):
-#                     block.recover()
-#                 else:
-#                     for j in range(len(block)):
-#                         block[j].recover()
-
-
-#     def decom_large_layer(self, ratio_LR=0.2):
-#         length = len(self.personalized)
-#         for idx, block in enumerate(self.personalized):
-#             # the last part of self.personalized is linear layer which is not decomposed
-#             if idx < length - 1:
-#                 if isinstance(block, MetaBasicBlock):
-#                     block.decom(ratio_LR=ratio_LR)
-#                 else:
-#                     for j in range(len(block)):
-#                         block[j].decom(ratio_LR=ratio_LR)
-
-
-#     def frobenius_decay(self):
-#         loss = torch.tensor(0.).to(self.cfg['device'])
-#         length = len(self.personalized)
-#         for idx, block in enumerate(self.personalized):
-#             # the last part of self.personalized is linear layer which is not decomposed
-#             if idx < length - 1:
-#                 if isinstance(block, MetaBasicBlock):
-#                     loss += block.frobenius_loss()
-#                 else:
-#                     for j in range(len(block)):
-#                         loss += block[j].frobenius_loss()
-#         return loss
-
-
-#     def kronecker_decay(self):
-#         loss = torch.tensor(0.).to(self.cfg['device'])
-#         length = len(self.personalized)
-#         for idx, block in enumerate(self.personalized):
-#             # the last part of self.personalized is linear layer which is not decomposed
-#             if idx < length - 1:
-#                 if isinstance(block, MetaBasicBlock):
-#                     loss += block.kronecker_loss()
-#                 else:
-#                     for j in range(len(block)):
-#                         loss += block[j].kronecker_loss()
-#         return loss
-
-
-#     # def L2_decay(self):
-#     #     loss = torch.tensor(0.).to(self.cfg.device)
-#     #     length = len(self.personalized)
-#     #     for idx, block in enumerate(self.personalized):
-#     #         # the last part of self.personalized is linear layer which is not decomposed
-#     #         if idx < length - 1:
-#     #             if isinstance(block, MetaBasicBlock):
-#     #                 loss += block.L2_loss()
-#     #             else:
-#     #                 for j in range(len(block)):
-#     #                     loss += block[j].L2_loss()
-#     #     return loss
-
-#     def L2_decay(self):
-#         loss = torch.tensor(0.).to(self.cfg.device if self.cfg else 'cuda')
-
-#         # 定义一个内部函数来递归处理各种层
-#         def add_l2_loss(module):
-#             local_loss = torch.tensor(0.).to(loss.device)
-            
-#             # 情况1: 如果模块有自定义的 L2_loss 方法 (例如 MetaBasicBlock)，优先使用它
-#             if hasattr(module, 'L2_loss'):
-#                 local_loss += module.L2_loss()
-                
-#             # 情况2: 如果是基础的带权层 (Conv2d, Linear)，且没有被自定义方法处理过
-#             # 注意: MetaBasicBlock 也有 Conv2d，但上面的 hasattr 会拦截它，防止重复计算
-#             elif isinstance(module, (nn.Conv2d, nn.Linear)):
-#                 # 只对 weight 做衰减，通常不对 bias 做 L2 (这也是 PyTorch optim 的默认行为之一，虽然 strict WD 会包含)
-#                 if module.weight.requires_grad:
-#                     local_loss += torch.sum(module.weight ** 2)
-                    
-#             # 情况3: 如果是容器 (Sequential, ModuleList, 或普通的 BasicBlock)，递归处理子模块
-#             else:
-#                 for child in module.children():
-#                     local_loss += add_l2_loss(child)
-                    
-#             return local_loss
-
-#         # ------------------------------------------------------
-#         # 遍历模型的两个主要部分：Common (前半截) 和 Personalized (后半截)
-#         # ------------------------------------------------------
-        
-#         # 1. 处理 Common 层 (包含 Head 和 前期全秩 Blocks)
-#         # self.common 是一个 nn.Sequential
-#         loss += add_l2_loss(self.common)
-
-#         # 2. 处理 Personalized 层 (包含 Meta Blocks, 后期 Blocks 和 Tail)
-#         # self.personalized 也是一个 nn.Sequential
-#         loss += add_l2_loss(self.personalized)
-
-#         return loss
-
-
-#     def cal_smallest_svdvals(self): # 计算奇异值最小值，论证论文中的理论部分，分解后的奇异值有下界
-#         """
-#         calculate the smallest singular value of each residual block.
-#         For example, if the model is resnet18, then there are 8 residual blocks.
-#         """
-#         smallest_svdvals = []
-#         length = len(self.personalized)
-#         for idx, block in enumerate(self.personalized):
-#             # the last part of self.personalized is linear layer which is not decomposed
-#             if idx < length - 1:
-#                 if isinstance(block, MetaBasicBlock):
-#                     smallest_svdvals.append(block.cal_smallest_svdvals())
-#                 else:
-#                     for j in range(len(block)):
-#                         smallest_svdvals.append(block[j].cal_smallest_svdvals())
-#         return smallest_svdvals
-
-
-#     def calculate_stage_anchor_loss(self, anchors):
-#         """
-#         计算内部存储的 4 个阶段特征与传入的 4 个锚点的 MSE 损失。
-        
-#         Args:
-#             anchors (list or tensor): 4 个锚点。
-#         """
-#         # 检查是否有特征 (防止 use_align=False 时调用报错)
-#         if not self.use_align or len(self.stage_features) == 0:
-#             return torch.tensor([0., 0., 0., 0.], device=self.parameters().__next__().device)
-
-#         losses = []
-        
-#         for i in range(4):
-#             # [关键修改 4] 直接从 self 读取
-#             feat = self.stage_features[i] 
-#             anchor = anchors[i]
-            
-#             # 1. Feature 归一化
-#             feat_norm = F.normalize(feat, p=2, dim=1)
-            
-#             # 2. Anchor 归一化 (处理 tensor 类型)
-#             if isinstance(anchor, torch.Tensor):
-#                 anchor = anchor.to(feat.device) 
-#                 anchor_norm = F.normalize(anchor, p=2, dim=-1)
-#             else:
-#                 # 如果 anchor 已经是 list 里的 tensor 且已归一化，直接用
-#                 anchor_norm = anchor
-
-#             # 3. 计算 MSE
-#             loss = F.mse_loss(feat_norm, anchor_norm.detach())
-#             losses.append(loss)
-            
-#         return torch.stack(losses)
-
-#     def forward(self, x):
-#         x = self.head(x)
-#         x = self.relu(x)
-#         self.stage_features = []
-#         # for idx, layer in enumerate(self.body):
-#         #     x = layer(x)
-
-#         # x = self.avgpool(x)
-#         # x = x.view(x.size(0), -1)
-#         # feature = x
-#         # x = self.tail(x)
-#         # return feature,x
-
-#         for i, stage_layer in enumerate(self.body):
-#             x = stage_layer(x)
-            
-#             # [关键修改 2] 如果开启对齐，计算特征并存入 self.stage_features
-#             if self.use_align:
-#                 # x: [B, C, H, W] -> aligner -> [B, align_dim]
-#                 aligned_feat = self.aligners[i](x)
-#                 self.stage_features.append(aligned_feat)
-
-#         # 最后的分类头
-#         x = self.avgpool(x)
-#         x = x.view(x.size(0), -1)
-#         # pooled_feature = x # 如果外面需要用到池化后的特征，可以留着
-#         logits = self.tail(x)
-
-#         # [关键修改 3] 只返回 logits (或者 x, logits)，不再返回 feature 列表
-#         # 这样保持了接口的简洁性，外部调用不需要解包那么长
-#         return x, logits
+        # [关键修改 3] 只返回 logits (或者 x, logits)，不再返回 feature 列表
+        # 这样保持了接口的简洁性，外部调用不需要解包那么长
+        return x, logits
         
 
 

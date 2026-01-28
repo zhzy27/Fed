@@ -40,11 +40,15 @@ class WorkerFedOur(object):
         
         # create dataset (as well as the potential data_partitioner) for training.
 
-        self.text_model, _, self.output_dim = self.load_clip_text_model()
+        self.text_model, _ = self.load_clip_text_model()
+        self.anchor = self.generate_text_anchors()
+        self.output_dim = self.anchor[0].shape[-1] 
+        
+        print(f"Anchors generated. Count: {len(self.anchor)}, Dim: {self.output_dim}")
         conf.output_dim = self.output_dim 
         self.conf = conf
 
-        self.anchor = self.generate_text_anchors()
+        
         print("anchor:{self.anchor}")
 
         dist.barrier()
@@ -89,7 +93,6 @@ class WorkerFedOur(object):
         # 这样我们才能执行 del model.visual 操作。
         # model 的 preprocess (针对图像) 我们直接忽略，用不到。
         model, _ = clip.load(model_name, device=device, download_root=save_dir, jit=False)
-        output_dim = model.text_projection.shape[1]
         # [关键修改 2] 删除视觉编码器部分
         # 这会释放掉 ViT 或 ResNet 部分占用的显存
         if hasattr(model, 'visual'):
@@ -114,7 +117,7 @@ class WorkerFedOur(object):
         model.eval()
         model.to("cuda")
 
-        return model, device, output_dim
+        return model, device
     
 
     def generate_text_anchors(self):
@@ -168,7 +171,6 @@ class WorkerFedOur(object):
         # CLIP 官方推荐使用 "a photo of a {label}"
         prompts = [f"a photo of a {c}" for c in classes]
         
-        print(f"Generating {len(prompts)} text anchors for dataset: {dataset_name}...")
 
         # 4. Tokenize
         # clip.tokenize 会自动截断或填充到 77 token 长度
@@ -179,14 +181,55 @@ class WorkerFedOur(object):
         self.text_model.eval()
         with torch.no_grad():
             # encode_text 是 CLIP 模型提取文本特征的标准方法
-            text_features = self.text_model.encode_text(text_inputs)
+            x = self.text_model.token_embedding(text_inputs).type(self.text_model.dtype)
+            x = x + self.text_model.positional_embedding.type(self.text_model.dtype)
+            x = x.permute(1, 0, 2)  # NLD -> LND
             
-            # [重要] 归一化
-            # CLIP 的特征必须做 L2 归一化，因为它是基于余弦相似度训练的
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            # 2. 获取 Transformer 的层数
+            # ViT-B/32 的 layers=12
+            layers = self.text_model.transformer.resblocks
+            total_layers = len(layers)
             
-        # text_features shape: [num_classes, feature_dim] (e.g., [10, 512] for cifar10)
-        return text_features
+            # 3. 定义我们要截取的节点 (均匀分布)
+            # 例如 12层 -> [2, 5, 8, 11] (索引从0开始)
+            # 这里的逻辑是：ResNet Stage1 对齐 Layer3，Stage4 对齐 Layer12
+            indices = [
+                int(total_layers * 1 / 4) - 1,
+                int(total_layers * 2 / 4) - 1,
+                int(total_layers * 3 / 4) - 1,
+                total_layers - 1
+            ]
+            
+            anchors_list = []
+            
+            # 4. 前向传播并截取
+            for i, layer in enumerate(layers):
+                x = layer(x)
+                
+                if i in indices:
+                    # 取出 [EOS] token 的特征 (就像 CLIP 标准做法一样)
+                    # x 形状: [L, Batch, Dim] -> permute -> [Batch, L, Dim]
+                    x_temp = x.permute(1, 0, 2)
+                    
+                    # text_inputs.argmax(dim=-1) 找到 EOS 的位置
+                    # 提取特征
+                    sent_emb = x_temp[torch.arange(x_temp.shape[0]), text_inputs.argmax(dim=-1)]
+                    
+                    # [关键]
+                    # 只有最后一层 (i == total_layers - 1) 需要通过 text_projection 映射到联合空间
+                    # 前面的层保持原样，或者也通过 LayerNorm
+                    if i == total_layers - 1:
+                        sent_emb = self.text_model.ln_final(sent_emb).type(self.text_model.dtype)
+                        sent_emb = sent_emb @ self.text_model.text_projection
+                    else:
+                        # 中间层通常不需要 ln_final，或者你可以选择加上
+                        pass 
+
+                    # 归一化 (一定要做!)
+                    sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
+                    anchors_list.append(sent_emb.float()) # 转回 float32
+
+            return anchors_list # 返回包含 4 个 Tensor 的列表
 
     def recv_extra_info_from_master(self):
         pass
@@ -307,85 +350,43 @@ class WorkerFedOur(object):
         self._prepare_train()
 
     def local_training_with_extra_calculate(self, loss, output, data_batch, feature=None, target=None):
-        """
-        计算额外的损失项。
-        包含严格的调试检查：如果缺少 feature, anchor 或 target，直接报错。
-        """
+        # 1. 基础损失
+        total_loss = loss + self.conf.meta_L2 * self.model.L2_decay()
+
+        # 2. 计算层级锚点损失
+        # 检查是否开启对齐 (可以通过 output 里的 stage_features 是否为空，或者 check use_align)
+        # 注意：这里需要确保你已经正确解包了 output，例如 x, logits = output
+        # 或者你现在的 output 就是 logits，而 stage_features 存在 self.model.stage_features 里
         
-        # 1. 计算原有的 L2 正则损失
-        # 这一步通常不会出错，所以先算出来
-        l2_loss = self.conf.meta_L2 * self.model.L2_decay()
-        total_loss = loss + l2_loss
+        if self.model.use_align and hasattr(self, 'anchor'):
+            
+            # [关键步骤 A] 获取当前 Batch 的标签
+            if "target" in data_batch:
+                current_target = data_batch["target"]
+            elif target is not None:
+                current_target = target.to(self.device)
+            else:
+                raise ValueError("local_training_with_extra_calculate") # 没标签没法算，直接返回
 
-        # ==========================================================
-        # 严格调试模式：检查所有必要条件
-        # ==========================================================
+            # [关键步骤 B] 根据标签挑选锚点
+            # self.anchor 是 list: [Tensor(10, 512), Tensor(10, 512)...]
+            # 我们需要构造 batch_anchors: [Tensor(B, 512), Tensor(B, 512)...]
+            current_batch_anchors = []
+            for layer_idx in range(4):
+                # 利用高级索引，选出当前 target 对应的锚点行
+                # layer_anchor shape: [Batch_Size, Dim]
+                layer_anchor = self.anchor[layer_idx][current_target]
+                current_batch_anchors.append(layer_anchor)
 
-        # [检查 1] 检查 feature 是否传入
-        if feature is None:
-            raise ValueError(
-                "[Debug Error] 'feature' is None! \n"
-                "请检查: \n"
-                "1. self._inference() 是否正确返回了 feature？\n"
-                "2. self._train() 调用此函数时是否传入了 feature=feature？"
-            )
-
-        # [检查 2] 检查 anchor 是否存在
-        if not hasattr(self, 'anchor') or self.anchor is None:
-            raise RuntimeError(
-                "[Debug Error] 'self.anchor' not found or is None! \n"
-                "请检查: \n"
-                "1. 是否调用了 self.generate_text_anchors()？\n"
-                "2. 是否成功执行了 self.register_buffer('anchor', ...)? \n"
-                "3. 确保 dataset name 正确且在生成列表里。"
-            )
-
-        # 对feature进行归一化
-        feature_norm = F.normalize(feature, p=2, dim=1)
-        
-        # [检查 3] 检查 Target (标签) 是否存在
-        # 我们需要标签来从 10 个锚点里挑出正确的那 1 个
-        current_target = None
-        if "target" in data_batch:
-            current_target = data_batch["target"]
-        elif target is not None:
-            current_target = target.to(feature_norm.device)
-        
-        if current_target is None:
-            raise ValueError(
-                "[Debug Error] No target label found! \n"
-                "无法找到类别标签，不知道该匹配哪个锚点。\n"
-                "请检查 data_batch['target'] 是否存在，或是否显式传入了 target 参数。"
-            )
-
-        # [检查 4] 检查设备一致性 (可选，但推荐)
-        if feature_norm.device != self.anchor.device:
-            # 尝试自动修复，或者报错
-            # 这里为了调试，如果不在一个设备上可能导致严重性能问题，这里选择自动迁移但打印警告，或者直接迁移
-            self.anchor = self.anchor.to(feature_norm.device)
-
-        # ==========================================================
-        # 计算 Anchor Loss
-        # ==========================================================
-        
-        # 1. 选取对应锚点
-        # 如果 label 越界 (例如 cifar10 出现了 label 10)，这里会报 PyTorch IndexError
-        try:
-            target_anchors = self.anchor[current_target]
-        except IndexError as e:
-            raise IndexError(
-                f"[Debug Error] Label index out of range! \n"
-                f"self.anchor shape: {self.anchor.shape}, "
-                f"Max label in batch: {current_target.max()}. \n"
-                f"Original Error: {e}"
-            )
-        target_anchors = target_anchors.to(feature.dtype)
-        # 2. 计算 MSE
-        # feature: [B, Dim], target_anchors: [B, Dim]
-        anchor_loss_val = F.mse_loss(feature_norm, target_anchors.detach())
-        
-        # 3. 加权
-        total_loss += self.conf.anchor_loss * anchor_loss_val
+            # [关键步骤 C] 传入处理好的 Batch 锚点
+            # 返回的是 shape 为 [4] 的 tensor，包含 4 个阶段的 loss
+            loss_vec = self.model.calculate_stage_anchor_loss(current_batch_anchors)
+            
+            # [关键步骤 D] 求和并加权
+            # 因为 loss_vec 是 [L1, L2, L3, L4]，你需要把它变成一个标量才能加到 total_loss
+            anchor_loss_scalar = torch.sum(loss_vec) 
+            
+            total_loss += self.conf.anchor_loss * anchor_loss_scalar
 
         return total_loss
 

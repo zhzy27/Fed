@@ -22,7 +22,7 @@ import clip
 
 class MasterFedOur(object):
     def __init__(self, conf):
-        
+        self.conf = conf
         # some initializations.
         self.client_ids = list(range(1, 1 + conf.n_clients))
         self.world_ids = list(range(1, 1 + conf.n_participated))
@@ -36,7 +36,9 @@ class MasterFedOur(object):
         # )
         # 恢复全局模型
 
-        _, _, self.output_dim = self.load_clip_text_model()
+        self.text_model, _ = self.load_clip_text_model()
+        self.anchor = self.generate_text_anchors()
+        self.output_dim = self.anchor[0].shape[-1] 
         conf.output_dim = self.output_dim
         self.conf = conf
 
@@ -190,7 +192,119 @@ class MasterFedOur(object):
         model.eval()
         model.to("cuda")
 
-        return model, device, output_dim
+        return model, device
+
+    def generate_text_anchors(self):
+        """
+        根据数据集名称生成文本锚点 (Text Anchors)。
+        
+        流程:
+        1. 获取类别名称列表 (classes).
+        2. 构造 Prompts (templates).
+        3. Tokenize -> Text Encoder -> Normalize.
+        """
+        
+        # 1. 获取当前设备
+        # 假设 self.text_model 已经在正确的 device 上 (比如 cpu 或 cuda)
+        device = next(self.text_model.parameters()).device
+        
+        # 2. 定义数据集与其对应的类别列表
+        # 这里列出了 CIFAR-10 和 CIFAR-100 的标准类别
+        data_classes_registry = {
+            "cifar10": [
+                "airplane", "automobile", "bird", "cat", "deer",
+                "dog", "frog", "horse", "ship", "truck"
+            ],
+            "cifar100": [
+                'apple', 'aquarium fish', 'baby', 'bear', 'beaver', 'bed', 'bee', 'beetle', 
+                'bicycle', 'bottle', 'bowl', 'boy', 'bridge', 'bus', 'butterfly', 'camel', 
+                'can', 'castle', 'caterpillar', 'cattle', 'chair', 'chimpanzee', 'clock', 
+                'cloud', 'cockroach', 'couch', 'crab', 'crocodile', 'cup', 'dinosaur', 
+                'dolphin', 'elephant', 'flatfish', 'forest', 'fox', 'girl', 'hamster', 
+                'house', 'kangaroo', 'keyboard', 'lamp', 'lawn_mower', 'leopard', 'lion', 
+                'lizard', 'lobster', 'man', 'maple_tree', 'motorcycle', 'mountain', 'mouse', 
+                'mushroom', 'oak_tree', 'orange', 'orchid', 'otter', 'palm_tree', 'pear', 
+                'pickup_truck', 'pine_tree', 'plain', 'plate', 'poppy', 'porcupine', 
+                'possum', 'rabbit', 'raccoon', 'ray', 'road', 'rocket', 'rose', 
+                'sea', 'seal', 'shark', 'shrew', 'skunk', 'skyscraper', 'snail', 'snake', 
+                'spider', 'squirrel', 'streetcar', 'sunflower', 'sweet_pepper', 'table', 
+                'tank', 'telephone', 'television', 'tiger', 'tractor', 'train', 'trout', 
+                'tulip', 'turtle', 'wardrobe', 'whale', 'willow_tree', 'wolf', 'woman', 'worm'
+            ],
+            # 你可以在这里添加 tinyimagenet 或其他数据集
+        }
+
+        dataset_name = self.conf.data.lower() # 确保大小写匹配
+        
+        if dataset_name not in data_classes_registry:
+            raise ValueError(f"Dataset '{dataset_name}' not found in registry. Please add class names to generate_text_anchors.")
+        
+        classes = data_classes_registry[dataset_name]
+        
+        # 3. 构造提示词 (Prompt Template)
+        # CLIP 官方推荐使用 "a photo of a {label}"
+        prompts = [f"a photo of a {c}" for c in classes]
+        
+
+        # 4. Tokenize
+        # clip.tokenize 会自动截断或填充到 77 token 长度
+        text_inputs = clip.tokenize(prompts).to(device)
+        
+        # 5. 提取特征 (Inference)
+        # 确保不计算梯度，确保模型处于 eval 模式
+        self.text_model.eval()
+        with torch.no_grad():
+            # encode_text 是 CLIP 模型提取文本特征的标准方法
+            x = self.text_model.token_embedding(text_inputs).type(self.text_model.dtype)
+            x = x + self.text_model.positional_embedding.type(self.text_model.dtype)
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            
+            # 2. 获取 Transformer 的层数
+            # ViT-B/32 的 layers=12
+            layers = self.text_model.transformer.resblocks
+            total_layers = len(layers)
+            
+            # 3. 定义我们要截取的节点 (均匀分布)
+            # 例如 12层 -> [2, 5, 8, 11] (索引从0开始)
+            # 这里的逻辑是：ResNet Stage1 对齐 Layer3，Stage4 对齐 Layer12
+            indices = [
+                int(total_layers * 1 / 4) - 1,
+                int(total_layers * 2 / 4) - 1,
+                int(total_layers * 3 / 4) - 1,
+                total_layers - 1
+            ]
+            
+            anchors_list = []
+            
+            # 4. 前向传播并截取
+            for i, layer in enumerate(layers):
+                x = layer(x)
+                
+                if i in indices:
+                    # 取出 [EOS] token 的特征 (就像 CLIP 标准做法一样)
+                    # x 形状: [L, Batch, Dim] -> permute -> [Batch, L, Dim]
+                    x_temp = x.permute(1, 0, 2)
+                    
+                    # text_inputs.argmax(dim=-1) 找到 EOS 的位置
+                    # 提取特征
+                    sent_emb = x_temp[torch.arange(x_temp.shape[0]), text_inputs.argmax(dim=-1)]
+                    
+                    # [关键]
+                    # 只有最后一层 (i == total_layers - 1) 需要通过 text_projection 映射到联合空间
+                    # 前面的层保持原样，或者也通过 LayerNorm
+                    if i == total_layers - 1:
+                        sent_emb = self.text_model.ln_final(sent_emb).type(self.text_model.dtype)
+                        sent_emb = sent_emb @ self.text_model.text_projection
+                    else:
+                        # 中间层通常不需要 ln_final，或者你可以选择加上
+                        pass 
+
+                    # 归一化 (一定要做!)
+                    sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
+                    anchors_list.append(sent_emb.float()) # 转回 float32
+
+            return anchors_list # 返回包含 4 个 Tensor 的列表
+
 
     def decom_recover_loss(self):
         self.master_model.eval()
@@ -499,37 +613,6 @@ class MasterFedOur(object):
                     m.decom(current_rank)
             model.to('cpu')
 
-
-    # def recover_aggrevate(self, selected_client_ids):
-    #     # 1. 定义权重 (Origin逻辑: 默认为均匀平均)
-    #     n_selected_clients = len(selected_client_ids)
-    #     weights = [1.0 / n_selected_clients for _ in range(n_selected_clients)]
-
-    #     # 2. 将所有选中的客户端模型状态封装为 ModuleState 对象
-    #     # 这完全对应 Origin 代码中的 local_states = [ModuleState(...) for ...]
-    #     local_states = []
-    #     for client_id in selected_client_ids:
-    #         # Modified 版本中模型存储在 list 的元组里，取 [1]
-    #         local_model = self.client_models[client_id][1]
-    #         # 关键：使用 deepcopy 确保数据独立，防止引用修改
-    #         local_states.append(ModuleState(copy.deepcopy(local_model.state_dict())))
-
-    #     # 3. 执行加权聚合 (完全照搬 Origin 的数学逻辑)
-    #     # model_state = state[0] * w[0] + state[1] * w[1] + ...
-    #     model_state = local_states[0] * weights[0]
-        
-    #     for idx in range(1, len(local_states)):
-    #         model_state += local_states[idx] * weights[idx]
-
-    #     # 4. 将聚合后的状态复制回模型对象
-    #     # 取第一个客户端的模型作为结构底板 (template)
-    #     base_client_id = selected_client_ids[0]
-    #     aggregated_model = copy.deepcopy(self.client_models[base_client_id][1])
-        
-    #     # 使用 ModuleState 自带的 copy_to_module 方法
-    #     model_state.copy_to_module(aggregated_model)
-
-    #     return aggregated_model
 
     # def recover_aggrevate(self, selected_client_ids):
     #     """
