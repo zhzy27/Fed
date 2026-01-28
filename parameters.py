@@ -29,6 +29,7 @@ def get_args():
     parser.add_argument("--work_dir", default=None, type=str)
     parser.add_argument("--remote_exec", default=False, type=str2bool)
     parser.add_argument("--meta_L2", default=0, type=float)
+    parser.add_argument("--anchor_loss",default=0, type=float)
 
 
     # dataset.

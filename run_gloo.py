@@ -21,6 +21,7 @@ MethodTable = {
     "fedadam_gkd":[MasterFedAdam, WorkerFedGKD],
     "fedensemble":[MasterFedEnsemble, Worker],
     "fedhm":[MasterFedHM, WorkerFedHM],
+    "fedour":[MasterFedOur, WorkerFedOur],
 }
 
 def random_rank_creator(conf):

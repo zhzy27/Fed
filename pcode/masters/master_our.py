@@ -18,11 +18,11 @@ from pcode.utils.early_stopping import EarlyStoppingTracker
 import torch.nn.utils as torch_utils
 from pcode.models.resnet import MetaBasicBlock
 from torch import nn
+import clip
 
-class MasterFedHM(object):
+class MasterFedOur(object):
     def __init__(self, conf):
-        self.conf = conf
-
+        
         # some initializations.
         self.client_ids = list(range(1, 1 + conf.n_clients))
         self.world_ids = list(range(1, 1 + conf.n_participated))
@@ -36,9 +36,12 @@ class MasterFedHM(object):
         # )
         # 恢复全局模型
 
+        _, _, self.output_dim = self.load_clip_text_model()
+        conf.output_dim = self.output_dim
+        self.conf = conf
 
         self.used_client_archs =[create_model.determine_arch(conf, client_id, use_complex_arch=True) for client_id in range(1, 1 + conf.n_clients)]  # 所有客户端模型架构名称
-
+        
         
         self.conf.used_client_archs = self.used_client_archs
 
@@ -141,6 +144,53 @@ class MasterFedHM(object):
         checkpoint.save_arguments(conf) # 将超参数保存在json文件中
 
 
+
+    def load_clip_text_model(self, model_name="ViT-B/32", save_dir="./model_state/"):
+        """
+        仅加载 CLIP 的文本提取部分。
+        
+        1. 自动检查本地/下载 (逻辑不变)。
+        2. 使用 jit=False 加载，以便我们可以修改模型结构。
+        3. 删除 visual 部分以节省显存。
+        """
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        print(f"Loading CLIP Text Backbone: {model_name}...")
+        
+        # [关键修改 1] jit=False: 允许我们将模型作为普通的 PyTorch nn.Module 加载，
+        # 这样我们才能执行 del model.visual 操作。
+        # model 的 preprocess (针对图像) 我们直接忽略，用不到。
+        model, _ = clip.load(model_name, device=device, download_root=save_dir, jit=False)
+        output_dim = model.text_projection.shape[1]
+        # [关键修改 2] 删除视觉编码器部分
+        # 这会释放掉 ViT 或 ResNet 部分占用的显存
+        if hasattr(model, 'visual'):
+            # 1. 先保存当前的数据类型 (通常是 float16 或 float32)
+            # 注意：如果 visual 已经被删了，这里会报错，所以要小心
+            try:
+                stored_dtype = model.visual.conv1.weight.dtype
+            except:
+                stored_dtype = torch.float16 # 默认备选
+                
+            # 2. 删除真正的视觉编码器 (释放显存)
+            del model.visual
+            if device == "cuda":
+                torch.cuda.empty_cache()
+                
+            # 3. [核心] 塞入一个假的 visual，只为了让 model.dtype 属性不报错
+            model.visual = DummyVisual(stored_dtype)
+                
+        print("Text-only model loaded. Visual encoder removed.")
+        
+        # 将模型设为评估模式 (对于文本部分这通常不影响，但好习惯)
+        model.eval()
+        model.to("cuda")
+
+        return model, device, output_dim
 
     def decom_recover_loss(self):
         self.master_model.eval()
@@ -792,3 +842,11 @@ def get_n_local_epoch(conf, n_participated):
             low=conf.min_local_epochs, high=conf.local_n_epochs, size=n_participated
         )
         return random_local_n_epochs
+    
+class DummyLayer:
+    def __init__(self, dtype):
+        self.weight = type('DummyTensor', (), {'dtype': dtype})()
+
+class DummyVisual:
+    def __init__(self, dtype):
+        self.conv1 = DummyLayer(dtype)

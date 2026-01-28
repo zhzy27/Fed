@@ -8,3 +8,4 @@ from .master_feddyn import *
 from .master_fedadam import *
 from .master_fedensemble import *
 from .master_fedhm import *
+from .master_our import *

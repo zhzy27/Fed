@@ -18,12 +18,14 @@ from pcode.utils.timer import Timer
 from pcode.utils.stat_tracker import RuntimeTracker
 import  time
 import copy
+import clip
+import os
 
 
-class WorkerFedHM(object):
+class WorkerFedOur(object):
     def __init__(self, conf):
+        
         self.conf = conf
-
         # some initializations.
         self.rank = conf.graph.rank
         conf.graph.worker_id = conf.graph.rank
@@ -35,8 +37,16 @@ class WorkerFedHM(object):
             verbosity_level=1 if conf.track_time else 0,
             log_fn=conf.logger.log_metric,
         )
-
+        
         # create dataset (as well as the potential data_partitioner) for training.
+
+        self.text_model, _, self.output_dim = self.load_clip_text_model()
+        conf.output_dim = self.output_dim 
+        self.conf = conf
+
+        self.anchor = self.generate_text_anchors()
+        print("anchor:{self.anchor}")
+
         dist.barrier()
         self.dataset = create_dataset.define_dataset(conf, data=conf.data, agg_data_ratio=conf.agg_data_ratio)
         _, self.data_partitioner = create_dataset.define_data_loader(
@@ -57,6 +67,126 @@ class WorkerFedHM(object):
         conf.logger.log(
             f"Worker-{conf.graph.worker_id} initialized dataset/criterion.\n"
         )   # 打印当前的进程编号
+
+
+    def load_clip_text_model(self, model_name="ViT-B/32", save_dir="./model_state/"):
+        """
+        仅加载 CLIP 的文本提取部分。
+        
+        1. 自动检查本地/下载 (逻辑不变)。
+        2. 使用 jit=False 加载，以便我们可以修改模型结构。
+        3. 删除 visual 部分以节省显存。
+        """
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        print(f"Loading CLIP Text Backbone: {model_name}...")
+        
+        # [关键修改 1] jit=False: 允许我们将模型作为普通的 PyTorch nn.Module 加载，
+        # 这样我们才能执行 del model.visual 操作。
+        # model 的 preprocess (针对图像) 我们直接忽略，用不到。
+        model, _ = clip.load(model_name, device=device, download_root=save_dir, jit=False)
+        output_dim = model.text_projection.shape[1]
+        # [关键修改 2] 删除视觉编码器部分
+        # 这会释放掉 ViT 或 ResNet 部分占用的显存
+        if hasattr(model, 'visual'):
+            # 1. 先保存当前的数据类型 (通常是 float16 或 float32)
+            # 注意：如果 visual 已经被删了，这里会报错，所以要小心
+            try:
+                stored_dtype = model.visual.conv1.weight.dtype
+            except:
+                stored_dtype = torch.float16 # 默认备选
+                
+            # 2. 删除真正的视觉编码器 (释放显存)
+            del model.visual
+            if device == "cuda":
+                torch.cuda.empty_cache()
+                
+            # 3. [核心] 塞入一个假的 visual，只为了让 model.dtype 属性不报错
+            model.visual = DummyVisual(stored_dtype)
+                
+        print("Text-only model loaded. Visual encoder removed.")
+        
+        # 将模型设为评估模式 (对于文本部分这通常不影响，但好习惯)
+        model.eval()
+        model.to("cuda")
+
+        return model, device, output_dim
+    
+
+    def generate_text_anchors(self):
+        """
+        根据数据集名称生成文本锚点 (Text Anchors)。
+        
+        流程:
+        1. 获取类别名称列表 (classes).
+        2. 构造 Prompts (templates).
+        3. Tokenize -> Text Encoder -> Normalize.
+        """
+        
+        # 1. 获取当前设备
+        # 假设 self.text_model 已经在正确的 device 上 (比如 cpu 或 cuda)
+        device = next(self.text_model.parameters()).device
+        
+        # 2. 定义数据集与其对应的类别列表
+        # 这里列出了 CIFAR-10 和 CIFAR-100 的标准类别
+        data_classes_registry = {
+            "cifar10": [
+                "airplane", "automobile", "bird", "cat", "deer",
+                "dog", "frog", "horse", "ship", "truck"
+            ],
+            "cifar100": [
+                'apple', 'aquarium fish', 'baby', 'bear', 'beaver', 'bed', 'bee', 'beetle', 
+                'bicycle', 'bottle', 'bowl', 'boy', 'bridge', 'bus', 'butterfly', 'camel', 
+                'can', 'castle', 'caterpillar', 'cattle', 'chair', 'chimpanzee', 'clock', 
+                'cloud', 'cockroach', 'couch', 'crab', 'crocodile', 'cup', 'dinosaur', 
+                'dolphin', 'elephant', 'flatfish', 'forest', 'fox', 'girl', 'hamster', 
+                'house', 'kangaroo', 'keyboard', 'lamp', 'lawn_mower', 'leopard', 'lion', 
+                'lizard', 'lobster', 'man', 'maple_tree', 'motorcycle', 'mountain', 'mouse', 
+                'mushroom', 'oak_tree', 'orange', 'orchid', 'otter', 'palm_tree', 'pear', 
+                'pickup_truck', 'pine_tree', 'plain', 'plate', 'poppy', 'porcupine', 
+                'possum', 'rabbit', 'raccoon', 'ray', 'road', 'rocket', 'rose', 
+                'sea', 'seal', 'shark', 'shrew', 'skunk', 'skyscraper', 'snail', 'snake', 
+                'spider', 'squirrel', 'streetcar', 'sunflower', 'sweet_pepper', 'table', 
+                'tank', 'telephone', 'television', 'tiger', 'tractor', 'train', 'trout', 
+                'tulip', 'turtle', 'wardrobe', 'whale', 'willow_tree', 'wolf', 'woman', 'worm'
+            ],
+            # 你可以在这里添加 tinyimagenet 或其他数据集
+        }
+
+        dataset_name = self.conf.data.lower() # 确保大小写匹配
+        
+        if dataset_name not in data_classes_registry:
+            raise ValueError(f"Dataset '{dataset_name}' not found in registry. Please add class names to generate_text_anchors.")
+        
+        classes = data_classes_registry[dataset_name]
+        
+        # 3. 构造提示词 (Prompt Template)
+        # CLIP 官方推荐使用 "a photo of a {label}"
+        prompts = [f"a photo of a {c}" for c in classes]
+        
+        print(f"Generating {len(prompts)} text anchors for dataset: {dataset_name}...")
+
+        # 4. Tokenize
+        # clip.tokenize 会自动截断或填充到 77 token 长度
+        text_inputs = clip.tokenize(prompts).to(device)
+        
+        # 5. 提取特征 (Inference)
+        # 确保不计算梯度，确保模型处于 eval 模式
+        self.text_model.eval()
+        with torch.no_grad():
+            # encode_text 是 CLIP 模型提取文本特征的标准方法
+            text_features = self.text_model.encode_text(text_inputs)
+            
+            # [重要] 归一化
+            # CLIP 的特征必须做 L2 归一化，因为它是基于余弦相似度训练的
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            
+        # text_features shape: [num_classes, feature_dim] (e.g., [10, 512] for cifar10)
+        return text_features
 
     def recv_extra_info_from_master(self):
         pass
@@ -156,6 +286,7 @@ class WorkerFedHM(object):
         # init the model and dataloader.
         if self.conf.graph.on_cuda:
             self.model = self.model.to(self.device)
+            self.text_model = self.text_model.to(self.device)
 
         self.optimizer = create_optimizer.define_optimizer(
             self.conf, model=self.model, optimizer_name=self.conf.optimizer
@@ -175,8 +306,88 @@ class WorkerFedHM(object):
     def prepare_train(self):
         self._prepare_train()
 
-    def local_training_with_extra_calculate(self, loss, output, data_batch, feature = None):
-        return loss + self.conf.meta_L2*self.model.L2_decay()
+    def local_training_with_extra_calculate(self, loss, output, data_batch, feature=None, target=None):
+        """
+        计算额外的损失项。
+        包含严格的调试检查：如果缺少 feature, anchor 或 target，直接报错。
+        """
+        
+        # 1. 计算原有的 L2 正则损失
+        # 这一步通常不会出错，所以先算出来
+        l2_loss = self.conf.meta_L2 * self.model.L2_decay()
+        total_loss = loss + l2_loss
+
+        # ==========================================================
+        # 严格调试模式：检查所有必要条件
+        # ==========================================================
+
+        # [检查 1] 检查 feature 是否传入
+        if feature is None:
+            raise ValueError(
+                "[Debug Error] 'feature' is None! \n"
+                "请检查: \n"
+                "1. self._inference() 是否正确返回了 feature？\n"
+                "2. self._train() 调用此函数时是否传入了 feature=feature？"
+            )
+
+        # [检查 2] 检查 anchor 是否存在
+        if not hasattr(self, 'anchor') or self.anchor is None:
+            raise RuntimeError(
+                "[Debug Error] 'self.anchor' not found or is None! \n"
+                "请检查: \n"
+                "1. 是否调用了 self.generate_text_anchors()？\n"
+                "2. 是否成功执行了 self.register_buffer('anchor', ...)? \n"
+                "3. 确保 dataset name 正确且在生成列表里。"
+            )
+
+        # 对feature进行归一化
+        feature_norm = F.normalize(feature, p=2, dim=1)
+        
+        # [检查 3] 检查 Target (标签) 是否存在
+        # 我们需要标签来从 10 个锚点里挑出正确的那 1 个
+        current_target = None
+        if "target" in data_batch:
+            current_target = data_batch["target"]
+        elif target is not None:
+            current_target = target.to(feature_norm.device)
+        
+        if current_target is None:
+            raise ValueError(
+                "[Debug Error] No target label found! \n"
+                "无法找到类别标签，不知道该匹配哪个锚点。\n"
+                "请检查 data_batch['target'] 是否存在，或是否显式传入了 target 参数。"
+            )
+
+        # [检查 4] 检查设备一致性 (可选，但推荐)
+        if feature_norm.device != self.anchor.device:
+            # 尝试自动修复，或者报错
+            # 这里为了调试，如果不在一个设备上可能导致严重性能问题，这里选择自动迁移但打印警告，或者直接迁移
+            self.anchor = self.anchor.to(feature_norm.device)
+
+        # ==========================================================
+        # 计算 Anchor Loss
+        # ==========================================================
+        
+        # 1. 选取对应锚点
+        # 如果 label 越界 (例如 cifar10 出现了 label 10)，这里会报 PyTorch IndexError
+        try:
+            target_anchors = self.anchor[current_target]
+        except IndexError as e:
+            raise IndexError(
+                f"[Debug Error] Label index out of range! \n"
+                f"self.anchor shape: {self.anchor.shape}, "
+                f"Max label in batch: {current_target.max()}. \n"
+                f"Original Error: {e}"
+            )
+        target_anchors = target_anchors.to(feature.dtype)
+        # 2. 计算 MSE
+        # feature: [B, Dim], target_anchors: [B, Dim]
+        anchor_loss_val = F.mse_loss(feature_norm, target_anchors.detach())
+        
+        # 3. 加权
+        total_loss += self.conf.anchor_loss * anchor_loss_val
+
+        return total_loss
 
     def add_grad(self):
         pass
@@ -196,10 +407,10 @@ class WorkerFedHM(object):
 
                 # inference and get current performance.
                 with self.timer("forward_pass", epoch=self.scheduler.epoch_):
-                    loss, performance, output = self._inference(data_batch)    # 前向传播
+                    loss, performance, output, feature = self._inference(data_batch)    # 前向传播
 
                 with self.timer("extra_forward_pass", epoch=self.scheduler.epoch_):
-                    loss = self.local_training_with_extra_calculate(loss, output, data_batch)  # 计算L2损失
+                    loss = self.local_training_with_extra_calculate(loss, output, data_batch, feature=feature,target = _target)  # 计算L2损失
                 with self.timer("backward_pass", epoch=self.scheduler.epoch_):
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -242,7 +453,7 @@ class WorkerFedHM(object):
     def _inference(self, data_batch):
         """Inference on the given model and get loss and accuracy."""
         # do the forward pass and get the output.
-        _,output = self.model(data_batch["input"]) 
+        feature,output = self.model(data_batch["input"]) 
 
         # evaluate the output and get the loss, performance.
         if self.conf.use_mixup:
@@ -274,7 +485,7 @@ class WorkerFedHM(object):
                 self.tracker.update_local_metrics(
                     performance[idx - 1], idx, n_samples=bsz
                 )
-        return loss, performance, output
+        return loss, performance, output, feature
 
     def attention(self, x):
         """
@@ -341,3 +552,10 @@ class WorkerFedHM(object):
         return True if self.conf.epoch_ >= self.conf.local_n_epochs else False
 
 
+class DummyLayer:
+    def __init__(self, dtype):
+        self.weight = type('DummyTensor', (), {'dtype': dtype})()
+
+class DummyVisual:
+    def __init__(self, dtype):
+        self.conv1 = DummyLayer(dtype)

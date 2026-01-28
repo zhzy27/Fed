@@ -17,7 +17,7 @@ def define_model(
     arch, model = define_cv_classification_model(
         conf, client_id, use_complex_arch, arch
     ) # 获取模型
-
+    
     # consistent the model.
     if to_consistent_model:
         consistent_model(conf, model)
