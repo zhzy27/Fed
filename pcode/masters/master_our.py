@@ -198,18 +198,16 @@ class MasterFedOur(object):
         """
         根据数据集名称生成文本锚点 (Text Anchors)。
         
-        流程:
-        1. 获取类别名称列表 (classes).
-        2. 构造 Prompts (templates).
-        3. Tokenize -> Text Encoder -> Normalize.
+        改进策略: Hierarchical Prompts (层级提示词)
+        不再截取 Transformer 中间层，而是使用 4 组不同抽象层级的 Prompt，
+        分别对应 ResNet 的 4 个 Stage。
         """
         
         # 1. 获取当前设备
-        # 假设 self.text_model 已经在正确的 device 上 (比如 cpu 或 cuda)
+        # 假设 self.text_model 已经在正确的 device 上
         device = next(self.text_model.parameters()).device
         
         # 2. 定义数据集与其对应的类别列表
-        # 这里列出了 CIFAR-10 和 CIFAR-100 的标准类别
         data_classes_registry = {
             "cifar10": [
                 "airplane", "automobile", "bird", "cat", "deer",
@@ -231,79 +229,85 @@ class MasterFedOur(object):
                 'tank', 'telephone', 'television', 'tiger', 'tractor', 'train', 'trout', 
                 'tulip', 'turtle', 'wardrobe', 'whale', 'willow_tree', 'wolf', 'woman', 'worm'
             ],
-            # 你可以在这里添加 tinyimagenet 或其他数据集
         }
 
-        dataset_name = self.conf.data.lower() # 确保大小写匹配
-        
+        dataset_name = self.conf.data.lower()
         if dataset_name not in data_classes_registry:
-            raise ValueError(f"Dataset '{dataset_name}' not found in registry. Please add class names to generate_text_anchors.")
+            raise ValueError(f"Dataset '{dataset_name}' not found. Please add classes.")
         
         classes = data_classes_registry[dataset_name]
         
-        # 3. 构造提示词 (Prompt Template)
-        # CLIP 官方推荐使用 "a photo of a {label}"
-        prompts = [f"a photo of a {c}" for c in classes]
-        
+        # ==============================================================================
+        # [核心修改] 定义 4 个阶段的层级化提示词模板
+        # 对应 ResNet 的 Stage 1 (底层) -> Stage 4 (高层)
+        # ==============================================================================
+        hierarchical_templates = [
+            # Stage 1: 关注底层视觉特征 (纹理、边缘、颜色)
+            "elementary visual features, edges, and textures of a {}",
+            
+            # Stage 2: 关注中层特征 (部件、模式)
+            "visual patterns, parts, and components of a {}",
+            
+            # Stage 3: 关注高层几何特征 (形状、结构)
+            "the visual shape, geometry, and structure of a {}",
+            
+            # Stage 4: 关注完整语义 (标准的分类描述)
+            "a photo of a {}"
+        ]
 
-        # 4. Tokenize
-        # clip.tokenize 会自动截断或填充到 77 token 长度
-        text_inputs = clip.tokenize(prompts).to(device)
+        print(f"Generating hierarchical text anchors for {dataset_name} using 4-stage prompts...")
         
-        # 5. 提取特征 (Inference)
-        # 确保不计算梯度，确保模型处于 eval 模式
+        anchors_list = []
+        
+        # 确保模型处于评估模式
         self.text_model.eval()
+        
         with torch.no_grad():
-            # encode_text 是 CLIP 模型提取文本特征的标准方法
-            x = self.text_model.token_embedding(text_inputs).type(self.text_model.dtype)
-            x = x + self.text_model.positional_embedding.type(self.text_model.dtype)
-            x = x.permute(1, 0, 2)  # NLD -> LND
-            
-            # 2. 获取 Transformer 的层数
-            # ViT-B/32 的 layers=12
-            layers = self.text_model.transformer.resblocks
-            total_layers = len(layers)
-            
-            # 3. 定义我们要截取的节点 (均匀分布)
-            # 例如 12层 -> [2, 5, 8, 11] (索引从0开始)
-            # 这里的逻辑是：ResNet Stage1 对齐 Layer3，Stage4 对齐 Layer12
-            indices = [
-                int(total_layers * 1 / 4) - 1,
-                int(total_layers * 2 / 4) - 1,
-                int(total_layers * 3 / 4) - 1,
-                total_layers - 1
-            ]
-            
-            anchors_list = []
-            
-            # 4. 前向传播并截取
-            for i, layer in enumerate(layers):
-                x = layer(x)
+            # 遍历 4 个模板，生成 4 组锚点
+            for i, template in enumerate(hierarchical_templates):
+                # 3. 构造当前阶段的 Prompt
+                prompts = [template.format(c) for c in classes]
                 
-                if i in indices:
-                    # 取出 [EOS] token 的特征 (就像 CLIP 标准做法一样)
-                    # x 形状: [L, Batch, Dim] -> permute -> [Batch, L, Dim]
-                    x_temp = x.permute(1, 0, 2)
-                    
-                    # text_inputs.argmax(dim=-1) 找到 EOS 的位置
-                    # 提取特征
-                    sent_emb = x_temp[torch.arange(x_temp.shape[0]), text_inputs.argmax(dim=-1)]
-                    
-                    # [关键]
-                    # 只有最后一层 (i == total_layers - 1) 需要通过 text_projection 映射到联合空间
-                    # 前面的层保持原样，或者也通过 LayerNorm
-                    if i == total_layers - 1:
-                        sent_emb = self.text_model.ln_final(sent_emb).type(self.text_model.dtype)
-                        sent_emb = sent_emb @ self.text_model.text_projection
-                    else:
-                        # 中间层通常不需要 ln_final，或者你可以选择加上
-                        pass 
+                # 4. Tokenize
+                text_inputs = clip.tokenize(prompts).to(device)
+                
+                # 5. 提取特征 (使用完整的 encode_text)
+                # 注意：这里我们不需要手动通过 layers 了，直接用 encode_text 获取最终对齐特征
+                # 因为我们是通过 Prompt 的含义来区分层级的，而不是通过网络深度
+                
+                # 为了防止之前提到的 'dtype' 报错 (如果 visual 删的不干净)，这里手动模拟 encode_text 流程最稳妥
+                # 流程: Embedding -> Transformer -> LayerNorm -> Projection
+                
+                # A. Embedding
+                x = self.text_model.token_embedding(text_inputs).type(self.text_model.dtype)
+                x = x + self.text_model.positional_embedding.type(self.text_model.dtype)
+                x = x.permute(1, 0, 2)  # NLD -> LND
 
-                    # 归一化 (一定要做!)
-                    sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
-                    anchors_list.append(sent_emb.float()) # 转回 float32
+                # B. Transformer (完整通过所有层)
+                x = self.text_model.transformer(x)
+                x = x.permute(1, 0, 2)  # LND -> NLD
+                
+                # C. LayerNorm & Take EOS feature
+                x = self.text_model.ln_final(x).type(self.text_model.dtype)
+                
+                # 取出 [EOS] token 对应的特征
+                sent_emb = x[torch.arange(x.shape[0]), text_inputs.argmax(dim=-1)]
+                
+                # D. Projection (映射到与图像对齐的空间)
+                if self.text_model.text_projection is not None:
+                    sent_emb = sent_emb @ self.text_model.text_projection
 
-            return anchors_list # 返回包含 4 个 Tensor 的列表
+                # 6. 归一化 (L2 Normalize)
+                # 这一步至关重要，CLIP 是基于 Cosine Similarity 的
+                sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
+                
+                # 7. 加入列表 (转为 float32 方便后续计算)
+                anchors_list.append(sent_emb.float())
+                
+                # print(f"  - Stage {i+1} anchors generated. Template: '{template.format('CLASS')}'")
+
+        # 返回包含 4 个 Tensor 的列表，每个 Tensor 形状 [Num_Classes, Dim]
+        return anchors_list # 返回包含 4 个 Tensor 的列表
 
 
     def decom_recover_loss(self):

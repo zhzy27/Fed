@@ -490,6 +490,20 @@ runtime: {'time': '2026-01-24 05:55:18', 'comm_round': 300, 'loss': 0.7398963506
 2026-01-24 05:55:18     Best performance of top1             (best comm_round 278.000, current comm_round 300.000): 90.56.
 2026-01-24 05:55:18     Best performance of loss2             (best comm_round 1.000, current comm_round 300.000): 0.0.
 
+our_jieduan 6.992714M
+        Get averaged performance from 1 data_loaders.
+runtime: {'time': '2026-01-28 21:38:55', 'comm_round': 300, 'loss': 0.552423526096344, 'top1': 85.1, 'loss2': 0.0} ({'split': 'test', 'type': 'aggregated_test_loader_0-0'})
+2026-01-28 21:38:55     The validation performance = {'loss': 0.552423526096344, 'top1': 85.1, 'loss2': 0.0}.
+2026-01-28 21:38:55     Best performance of loss             (best comm_round 297.000, current comm_round 300.000): 0.4696060945987701.
+2026-01-28 21:38:55     Best performance of top1             (best comm_round 264.000, current comm_round 300.000): 86.83.
+2026-01-28 21:38:55     Best performance of loss2             (best comm_round 1.000, current comm_round 300.000): 0.0.
+
+
+
+
+
+
+
 
 
 Sequential(
