@@ -51,12 +51,14 @@ class MasterFedHM(object):
         ]
 
         # 拷贝构建全局模型
-
+        
         self.master_model = copy.deepcopy(self.client_models[0][1])
-        for m in self.master_model.modules():
-                if isinstance(m, MetaBasicBlock):
-                    m.recover()
-
+        if "resnet" in self.conf.arch:
+            for m in self.master_model.modules():
+                    if isinstance(m, MetaBasicBlock):
+                        m.recover()
+        elif "cnn" in self.conf.arch:
+            self.master_model.recover_model()
 
         # self.decom_recover_loss()
         self.clientid2arch = list( # 获取所有客户端的模型名称
@@ -142,60 +144,60 @@ class MasterFedHM(object):
 
 
 
-    def decom_recover_loss(self):
-        self.master_model.eval()
-        self.master_model.to('cuda')
-        old_state_dict = copy.deepcopy(self.master_model.state_dict())
+    # def decom_recover_loss(self):
+    #     self.master_model.eval()
+    #     self.master_model.to('cuda')
+    #     old_state_dict = copy.deepcopy(self.master_model.state_dict())
 
 
-        for m in self.master_model.modules():
-                if isinstance(m, MetaBasicBlock):
-                    m.decom(100000000)
+    #     for m in self.master_model.modules():
+    #             if isinstance(m, MetaBasicBlock):
+    #                 m.decom(100000000)
 
 
-        self.master_model.to('cuda')
-        for m in self.master_model.modules():
-                if isinstance(m, MetaBasicBlock):
-                    m.recover()
+    #     self.master_model.to('cuda')
+    #     for m in self.master_model.modules():
+    #             if isinstance(m, MetaBasicBlock):
+    #                 m.recover()
         
-        new_state_dict = copy.deepcopy(self.master_model.state_dict())
+    #     new_state_dict = copy.deepcopy(self.master_model.state_dict())
         
-        total_diff = 0.0
-        max_diff = 0.0
+    #     total_diff = 0.0
+    #     max_diff = 0.0
 
-        for key in old_state_dict:
-            # 只比较卷积层权重，跳过 num_batches_tracked 等统计量
-            if 'weight' in key or 'bias' in key:
-                w_old = old_state_dict[key].float()
-                # 确保 new_state_dict 里有这个 key (因为分解层结构变了又变回来，key 应该一致)
-                if key in new_state_dict:
-                    w_new = new_state_dict[key].float()
-                    # 计算两个张量的差异 (L1 距离)
-                    diff = (w_old - w_new).abs().sum().item()
-                    # 记录最大元素级误差
-                    current_max = (w_old - w_new).abs().max().item()
+    #     for key in old_state_dict:
+    #         # 只比较卷积层权重，跳过 num_batches_tracked 等统计量
+    #         if 'weight' in key or 'bias' in key:
+    #             w_old = old_state_dict[key].float()
+    #             # 确保 new_state_dict 里有这个 key (因为分解层结构变了又变回来，key 应该一致)
+    #             if key in new_state_dict:
+    #                 w_new = new_state_dict[key].float()
+    #                 # 计算两个张量的差异 (L1 距离)
+    #                 diff = (w_old - w_new).abs().sum().item()
+    #                 # 记录最大元素级误差
+    #                 current_max = (w_old - w_new).abs().max().item()
                     
-                    total_diff += diff
-                    max_diff = max(max_diff, current_max)
-                else:
-                    print(f"⚠️ 警告: Key {key} 在还原后的模型中丢失！")
+    #                 total_diff += diff
+    #                 max_diff = max(max_diff, current_max)
+    #             else:
+    #                 print(f"⚠️ 警告: Key {key} 在还原后的模型中丢失！")
 
-        self.master_model.to('cpu')
+    #     self.master_model.to('cpu')
         
-        print(f"📊 检查结果:")
-        print(f"   累积总误差 (Sum Abs Diff): {total_diff:.4f}")
-        print(f"   最大单点误差 (Max Abs Diff): {max_diff:.6f}")
-        # 6. 自动判断
-        if max_diff < 1e-3:
-            print("✅ 成功: 还原误差极小。SVD 维度变换逻辑正确！")
-        else:
-            print("❌ 失败: 还原误差过大！")
-            print("   原因可能是：")
-            print("   1. decom/recover 里的 permute/view 维度搞反了 (最可能)。")
-            print("   2. decom 时传入的 Rank 太小，导致信息被大量截断。")
-        print("="*40 + "\n")
+    #     print(f"📊 检查结果:")
+    #     print(f"   累积总误差 (Sum Abs Diff): {total_diff:.4f}")
+    #     print(f"   最大单点误差 (Max Abs Diff): {max_diff:.6f}")
+    #     # 6. 自动判断
+    #     if max_diff < 1e-3:
+    #         print("✅ 成功: 还原误差极小。SVD 维度变换逻辑正确！")
+    #     else:
+    #         print("❌ 失败: 还原误差过大！")
+    #         print("   原因可能是：")
+    #         print("   1. decom/recover 里的 permute/view 维度搞反了 (最可能)。")
+    #         print("   2. decom 时传入的 Rank 太小，导致信息被大量截断。")
+    #     print("="*40 + "\n")
 
-        self.master_model.to('cpu')
+    #     self.master_model.to('cpu')
 
     def run(self):
 
@@ -425,11 +427,15 @@ class MasterFedHM(object):
             # 如果是分解状态（FactorizedConv），必须先 recover 回 Conv2d，
             # 否则 load_state_dict 会因为 Key 不匹配或形状不匹配而报错。
             # -----------------------------------------------------------
-            for m in model.modules():
-                if isinstance(m, MetaBasicBlock):
-                    # 判断依据：如果 conv1 不是标准的 Conv2d，说明它是分解过的 FactorizedConv
-                    if not isinstance(m.conv1, nn.Conv2d):
-                        m.recover()
+            if "resnet" in self.conf.arch:
+                for m in model.modules():
+                    if isinstance(m, MetaBasicBlock):
+                        # 判断依据：如果 conv1 不是标准的 Conv2d，说明它是分解过的 FactorizedConv
+                        if not isinstance(m.conv1, nn.Conv2d):
+                            m.recover()
+            elif "cnn" in self.conf.arch:
+                if model.meta:
+                    model.recover_model()
             model.to('cuda')
             # -----------------------------------------------------------
             # 【步骤 2：加载全量参数】
@@ -443,10 +449,13 @@ class MasterFedHM(object):
             # -----------------------------------------------------------
             current_rank = rank_list[selected_client_id] # 获取该客户端对应的 rank (或 ratio)
             
-            for m in model.modules():
-                if isinstance(m, MetaBasicBlock):
-                    # 这里的 decom 内部会执行 SVD 并把 Conv2d 替换为 FactorizedConv
-                    m.decom(current_rank)
+            if "resnet" in self.conf.arch:
+                for m in model.modules():
+                    if isinstance(m, MetaBasicBlock):
+                        # 这里的 decom 内部会执行 SVD 并把 Conv2d 替换为 FactorizedConv
+                        m.decom(current_rank)
+            elif "cnn" in self.conf.arch:
+                model.decom_model(current_rank)
             model.to('cpu')
 
 
@@ -585,26 +594,13 @@ class MasterFedHM(object):
             
             # 使用 modules() 递归遍历所有子模块，确保涵盖 body 和 personalized 中的所有块
             # 这里的 MetaBasicBlock 需要确保你的代码环境中能访问到该类定义
-            for m in model.modules():
-                if isinstance(m, MetaBasicBlock):
-                    # 调用你提供的 recover 方法，它会将 FactorizedConv 替换回 Conv2d
-                    m.recover()
-
-        # --- 中间步骤：验证逻辑 (保留不变) ---
-        if not self.conf.train_fast:  # test all the selected_clients
-            for client_idx in selected_client_ids:
-                # 为了不破坏原模型，这里深拷贝一份用于测试
-                test_model = copy.deepcopy(self.client_models[client_idx][1])
-                master_utils.do_validation(
-                    conf=self.conf,
-                    coordinator=self.local_coordinator[client_idx],
-                    model=test_model,
-                    criterion=self.criterion,
-                    metrics=self.metrics,
-                    data_loaders=self.test_loaders,
-                    label=f"aggregated_test_loader_{client_idx}",
-                )
-            self.additional_validation()
+            if "resnet" in self.conf.arch:
+                for m in model.modules():
+                    if isinstance(m, MetaBasicBlock):
+                        # 调用你提供的 recover 方法，它会将 FactorizedConv 替换回 Conv2d
+                        m.recover()
+            elif "cnn" in self.conf.arch:
+                model.recover_model()
 
         # --- 第二步：聚合逻辑 (替换为 ModuleState 方式) ---
         
