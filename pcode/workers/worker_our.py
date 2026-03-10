@@ -357,37 +357,49 @@ class WorkerFedOur(object):
         # 检查是否开启对齐 (可以通过 output 里的 stage_features 是否为空，或者 check use_align)
         # 注意：这里需要确保你已经正确解包了 output，例如 x, logits = output
         # 或者你现在的 output 就是 logits，而 stage_features 存在 self.model.stage_features 里
-        
-        if self.model.use_align and hasattr(self, 'anchor'):
-            
-            # [关键步骤 A] 获取当前 Batch 的标签
+        if "resnet" in self.conf.arch:
+            if self.model.use_align and hasattr(self, 'anchor'):
+                
+                # [关键步骤 A] 获取当前 Batch 的标签
+                if "target" in data_batch:
+                    current_target = data_batch["target"]
+                elif target is not None:
+                    current_target = target.to(self.device)
+                else:
+                    raise ValueError("local_training_with_extra_calculate") # 没标签没法算，直接返回
+
+                # [关键步骤 B] 根据标签挑选锚点
+                # self.anchor 是 list: [Tensor(10, 512), Tensor(10, 512)...]
+                # 我们需要构造 batch_anchors: [Tensor(B, 512), Tensor(B, 512)...]
+                current_batch_anchors = []
+                for layer_idx in range(4):
+                    # 利用高级索引，选出当前 target 对应的锚点行
+                    # layer_anchor shape: [Batch_Size, Dim]
+                    layer_anchor = self.anchor[layer_idx][current_target]
+                    current_batch_anchors.append(layer_anchor)
+
+                # [关键步骤 C] 传入处理好的 Batch 锚点
+                # 返回的是 shape 为 [4] 的 tensor，包含 4 个阶段的 loss
+                loss_vec = self.model.calculate_stage_anchor_loss(current_batch_anchors)
+                
+                # [关键步骤 D] 求和并加权
+                # 因为 loss_vec 是 [L1, L2, L3, L4]，你需要把它变成一个标量才能加到 total_loss
+                weight_tensor = torch.tensor(self.anchor_weight, device=loss_vec.device, dtype=loss_vec.dtype)
+                anchor_loss_scalar = torch.sum(loss_vec * weight_tensor)
+                
+                total_loss += self.conf.anchor_loss * anchor_loss_scalar
+        elif "cnn" in self.conf.arch:
             if "target" in data_batch:
                 current_target = data_batch["target"]
             elif target is not None:
                 current_target = target.to(self.device)
             else:
-                raise ValueError("local_training_with_extra_calculate") # 没标签没法算，直接返回
-
-            # [关键步骤 B] 根据标签挑选锚点
-            # self.anchor 是 list: [Tensor(10, 512), Tensor(10, 512)...]
-            # 我们需要构造 batch_anchors: [Tensor(B, 512), Tensor(B, 512)...]
-            current_batch_anchors = []
-            for layer_idx in range(4):
-                # 利用高级索引，选出当前 target 对应的锚点行
-                # layer_anchor shape: [Batch_Size, Dim]
-                layer_anchor = self.anchor[layer_idx][current_target]
-                current_batch_anchors.append(layer_anchor)
-
-            # [关键步骤 C] 传入处理好的 Batch 锚点
-            # 返回的是 shape 为 [4] 的 tensor，包含 4 个阶段的 loss
-            loss_vec = self.model.calculate_stage_anchor_loss(current_batch_anchors)
-            
-            # [关键步骤 D] 求和并加权
-            # 因为 loss_vec 是 [L1, L2, L3, L4]，你需要把它变成一个标量才能加到 total_loss
-            weight_tensor = torch.tensor(self.anchor_weight, device=loss_vec.device, dtype=loss_vec.dtype)
-            anchor_loss_scalar = torch.sum(loss_vec * weight_tensor)
-            
-            total_loss += self.conf.anchor_loss * anchor_loss_scalar
+                raise ValueError("local_training_with_extra_calculate")
+            sleleted_anchor = self.anchor[-1][current_target]
+            aligned_feature = self.model.clip_adapter(feature)
+            aligned_feature = F.normalize(aligned_feature, p=2,dim=1)
+            mse_loss = F.mse_loss(aligned_feature, sleleted_anchor)
+            total_loss = total_loss + 0.75*mse_loss
 
         return total_loss
 

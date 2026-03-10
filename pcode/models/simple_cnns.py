@@ -220,6 +220,7 @@ class MetaCNN(nn.Module):
         self.rank_rate = rank_rate # 秩率
         self.w_conv_bias = w_conv_bias # 记录配置以便恢复时使用
         self.w_fc_bias = w_fc_bias
+        self.meta = True
 
         # BN层通常不需要卷积偏置
         use_conv_bias = False 
@@ -306,6 +307,9 @@ class MetaCNN(nn.Module):
 
     def decom_model(self, rank_rate):
         """将 conv5 和 fc1 分解为低秩层"""
+
+        self.meta = True
+
         if rank_rate >= 1.0:
             return
         
@@ -327,6 +331,9 @@ class MetaCNN(nn.Module):
 
     def recover_model(self):
         """将 conv5 和 fc1 恢复为完整层"""
+
+        self.meta = False
+
         if self.rank_rate >= 1.0:
             return
 
@@ -348,7 +355,7 @@ class MetaCNN(nn.Module):
 
     # === 正则化 Loss 计算 (用于低秩训练阶段) ===
     
-    def get_decomposed_loss(self, type='frobenius'):
+    def L2_decay(self, type='frobenius'):
         """计算分解层的正则化损失"""
         loss = torch.tensor(0.0, device=self.conv1.weight.device)
         
