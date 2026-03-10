@@ -39,7 +39,7 @@ class WorkerFedOur(object):
         )
         
         # create dataset (as well as the potential data_partitioner) for training.
-
+        self.anchor_weight = torch.tensor([0.125, 0.25, 0.5, 1.0], device=self.device)
         self.text_model, _ = self.load_clip_text_model()
         self.anchor = self.generate_text_anchors()
         self.output_dim = self.anchor[0].shape[-1] 
@@ -384,7 +384,8 @@ class WorkerFedOur(object):
             
             # [关键步骤 D] 求和并加权
             # 因为 loss_vec 是 [L1, L2, L3, L4]，你需要把它变成一个标量才能加到 total_loss
-            anchor_loss_scalar = torch.sum(loss_vec) 
+            weight_tensor = torch.tensor(self.anchor_weight, device=loss_vec.device, dtype=loss_vec.dtype)
+            anchor_loss_scalar = torch.sum(loss_vec * weight_tensor)
             
             total_loss += self.conf.anchor_loss * anchor_loss_scalar
 
