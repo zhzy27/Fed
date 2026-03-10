@@ -192,7 +192,7 @@ class MasterFedOur(object):
         
         # 将模型设为评估模式 (对于文本部分这通常不影响，但好习惯)
         model.eval()
-        model.to("cuda")
+        model.to("cuda:7")
 
         return model, device
 
@@ -585,7 +585,7 @@ class MasterFedOur(object):
 
         for selected_client_id in selected_client_ids:
             model = self.client_models[selected_client_id][1] # 取出模型对象
-            model.to('cuda')
+            model.to('cuda:7')
             # -----------------------------------------------------------
             # 【步骤 1：结构对齐】
             # 在加载参数前，必须先检查模型是否处于分解状态。
@@ -601,7 +601,7 @@ class MasterFedOur(object):
             elif "cnn" in self.conf.arch:
                 if model.meta:
                     model.recover_model()
-            model.to('cuda')
+            model.to('cuda:7')
             # -----------------------------------------------------------
             # 【步骤 2：加载全量参数】
             # 现在 model 结构和 master 一模一样了，可以安全加载
