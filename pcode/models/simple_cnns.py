@@ -228,15 +228,19 @@ class MetaCNN(nn.Module):
         # === 前4层卷积 (保持固定，不进行分解) ===
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1, bias=use_conv_bias)
         self.bn1 = nn.GroupNorm(16, 32)
+        # self.bn1 = nn.BatchNorm2d(32)
         
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=use_conv_bias)
         self.bn2 = nn.GroupNorm(16, 64)
-        
+        # self.bn2 = nn.BatchNorm2d(64)
+
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=use_conv_bias)
         self.bn3 = nn.GroupNorm(16, 128)
-        
+        # self.bn3 = nn.BatchNorm2d(128)
+
         self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=use_conv_bias)
         self.bn4 = nn.GroupNorm(16, 256)
+        # self.bn4 = nn.BatchNorm2d(256)
 
         # === 第5层卷积 (可分解目标) ===
         # 输入: 256, 输出: 256
@@ -248,6 +252,7 @@ class MetaCNN(nn.Module):
                                         padding=1, stride=1, bias=use_conv_bias)
         
         self.bn5 = nn.GroupNorm(16, 256)
+        # self.bn5 = nn.BatchNorm2d(256)
 
         # 池化与Dropout
         self.pool = nn.MaxPool2d(2, 2)
@@ -271,6 +276,7 @@ class MetaCNN(nn.Module):
         # 输入是 fc1 输出的 512 维特征，输出是对齐 CLIP 的 512 维特征
         self.clip_adapter = nn.Sequential(
                 nn.Linear(512, 512),
+                nn.GroupNorm(16, 512),
                 nn.ReLU(inplace=True),
                 nn.Linear(512, 512)
                 )

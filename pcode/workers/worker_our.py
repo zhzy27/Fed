@@ -399,7 +399,7 @@ class WorkerFedOur(object):
             aligned_feature = self.model.clip_adapter(feature)
             aligned_feature = F.normalize(aligned_feature, p=2,dim=1)
             mse_loss = F.mse_loss(aligned_feature, sleleted_anchor)
-            total_loss = total_loss + 0.75*mse_loss
+            total_loss = total_loss + 1.5*mse_loss
 
         return total_loss
 
