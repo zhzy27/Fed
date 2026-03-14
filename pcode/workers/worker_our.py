@@ -349,7 +349,7 @@ class WorkerFedOur(object):
     def prepare_train(self):
         self._prepare_train()
 
-    def local_training_with_extra_calculate(self, loss, output, data_batch, feature=None, target=None):
+    def local_training_with_extra_calculate(self, loss, output, data_batch, feature=None, target=None, prototypes = None):
         # 1. 基础损失
         total_loss = loss + self.conf.meta_L2 * self.model.L2_decay()
 
@@ -399,18 +399,95 @@ class WorkerFedOur(object):
             aligned_feature = self.model.clip_adapter(feature)
             aligned_feature = F.normalize(aligned_feature, p=2,dim=1)
             mse_loss = F.mse_loss(aligned_feature, sleleted_anchor)
-            total_loss = total_loss + 1.5*mse_loss
+            total_loss = total_loss + 0.75*mse_loss
+
+        if prototypes is not None and len(prototypes) > 1:
+            if "target" in data_batch:
+                current_target = data_batch["target"]
+            else:
+                current_target = target.to(self.device)
+
+            # a. 提取所有的原型键，并排序保证顺序一致
+            proto_keys = sorted(list(prototypes.keys()))
+            proto_tensor = torch.stack([prototypes[k] for k in proto_keys]).to(self.device)
+
+            # b. 特征与原型做 L2 归一化
+            norm_feature = F.normalize(feature, p=2, dim=1)
+            norm_proto = F.normalize(proto_tensor, p=2, dim=1)
+
+            # c. 计算余弦相似度矩阵
+            temperature = getattr(self.conf, 'proto_temp', 0.5) 
+            sim_matrix = torch.matmul(norm_feature, norm_proto.T) / temperature
+
+            # d. 制作目标标签映射 (因为交叉熵的 target 必须是 0 到 C-1 的连续索引)
+            target_to_idx = {cls_name: idx for idx, cls_name in enumerate(proto_keys)}
+            
+            # 过滤掉万一没计算出原型的异常类 (稳健性设计)
+            valid_mask = torch.tensor([t.item() in target_to_idx for t in current_target], dtype=torch.bool, device=self.device)
+            
+            if valid_mask.any():
+                valid_sim_matrix = sim_matrix[valid_mask]
+                valid_targets = current_target[valid_mask]
+                
+                mapped_targets = torch.tensor(
+                    [target_to_idx[t.item()] for t in valid_targets], 
+                    device=self.device
+                )
+
+                # e. 计算交叉熵损失 (拉近同类，推远异类)
+                contrastive_loss = F.cross_entropy(valid_sim_matrix, mapped_targets)
+
+                # f. 累加总损失
+                proto_weight = getattr(self.conf, 'proto_contrastive_weight', 1.0)
+                total_loss += proto_weight * contrastive_loss
 
         return total_loss
 
     def add_grad(self):
         pass
 
+    def get_proto(self):
+        """
+        遍历所有批次，提取特征并计算每个类别的原型。
+        """
+        # 建议在提取特征时开启 eval 模式，避免影响 BatchNorm 的统计量
+        self.model.eval() 
+        class_features = {}
+        
+        with torch.no_grad():
+            for _input, _target in self.train_loader:
+                # 复用你的 load_data_batch 逻辑，这里 is_training 设为 False
+                data_batch = create_dataset.load_data_batch(
+                    self.conf, _input, _target, is_training=False, device=self.device
+                )
+                
+                # 获取特征
+                _, _, _, feature = self._inference(data_batch)
+                current_target = data_batch.get("target", _target).to(self.device)
+                
+                # 按类别收集特征
+                for i in range(len(current_target)):
+                    label = current_target[i].item()
+                    if label not in class_features:
+                        class_features[label] = []
+                    class_features[label].append(feature[i].detach())
+                    
+        prototypes = {}
+        # 计算每个类别的均值作为原型
+        for label, feats in class_features.items():
+            # feats 列表转换为 Tensor: [N, feature_dim]
+            prototypes[label] = torch.stack(feats).mean(dim=0)
+            
+        # 恢复训练模式
+        self.model.train()
+        return prototypes
+
+
     def _train(self):
         self.prepare_train() # 初始化指标追踪器，优化器等
         # entering local updates and will finish only after reaching the expected local_n_epochs.
         while True:
-
+            prototypes = self.get_proto()
             for _input, _target in self.train_loader:
 
                 # load data
@@ -424,7 +501,7 @@ class WorkerFedOur(object):
                     loss, performance, output, feature = self._inference(data_batch)    # 前向传播
 
                 with self.timer("extra_forward_pass", epoch=self.scheduler.epoch_):
-                    loss = self.local_training_with_extra_calculate(loss, output, data_batch, feature=feature,target = _target)  # 计算L2损失
+                    loss = self.local_training_with_extra_calculate(loss, output, data_batch, feature=feature,target = _target, prototypes = prototypes)  # 计算L2损失
                 with self.timer("backward_pass", epoch=self.scheduler.epoch_):
                     self.optimizer.zero_grad()
                     loss.backward()
