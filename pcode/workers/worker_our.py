@@ -439,6 +439,7 @@ class WorkerFedOur(object):
 
                 # f. 累加总损失
                 proto_weight = getattr(self.conf, 'proto_contrastive_weight', 1.0)
+                proto_weight = 0
                 total_loss += proto_weight * contrastive_loss
 
         return total_loss
