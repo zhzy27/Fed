@@ -72,6 +72,36 @@ class WorkerFedOur(object):
             f"Worker-{conf.graph.worker_id} initialized dataset/criterion.\n"
         )   # 打印当前的进程编号
 
+    def extra_init(self):
+        # 1. 冻结 CLIP 文本模型的自身参数
+        for param in self.text_model.parameters():
+            param.requires_grad = False
+            
+        # 2. 初始化可学习的 Prompt (Context Tokens)
+        n_ctx = 16  # 你可以调节提示词的长度 (如 4, 8, 16)
+        ctx_dim = self.text_model.token_embedding.weight.shape[1] # 通常是 512
+        
+        # 将参数挂载到 self.model 上，这样联邦通信和优化器都能自动接管
+        self.model.prompt_ctx = nn.Parameter(torch.empty(n_ctx, ctx_dim).to(self.device))
+        nn.init.normal_(self.model.prompt_ctx, std=0.02)
+        
+        # 3. 预先处理好类名的 Token (不带 "a photo of a")
+        # 假设你原来的 data_classes_registry 依然可用
+        dataset_name = self.conf.data.lower()
+        if dataset_name == "cifar10":
+            classes = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"]
+        elif dataset_name == "cifar100":
+            classes = ['apple', 'aquarium fish', 'baby', 'bear', 'beaver'] # 填入你的 cifar100 完整列表
+        else:
+            raise ValueError("Dataset not supported.")
+            
+        prompts = [f"{c}" for c in classes] # 只保留类别名
+        self.tokenized_prompts = clip.tokenize(prompts).to(self.device)
+        
+        # 预先提取类别名的基础 Embedding（节省每次前向传播的时间）
+        with torch.no_grad():
+            self.class_embedding = self.text_model.token_embedding(self.tokenized_prompts).type(self.text_model.dtype)
+
 
     def load_clip_text_model(self, model_name="ViT-B/32", save_dir="./model_state/"):
         """
@@ -119,6 +149,62 @@ class WorkerFedOur(object):
 
         return model, device
     
+    def get_dynamic_anchors(self):
+        """
+        每次迭代动态生成带有梯度的 Anchors。
+        流程: [SOS] + Learnable_Context + [Class_Name] + [EOS]
+        """
+        # 注意：这里一定不能用 torch.no_grad()，因为我们需要 prompt_ctx 的梯度！
+        self.text_model.eval() 
+        
+        batch_size = len(self.class_embedding)
+        n_ctx = self.model.prompt_ctx.shape[0]
+        
+        # 将 context 扩展到所有类别: [Num_Classes, n_ctx, Dim]
+        ctx = self.model.prompt_ctx.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # CLIP Token 结构分离
+        # prefix: [SOS] token (索引 0)
+        # suffix: 类别名称 + [EOS] + 填充 (索引 1 开始)
+        prefix = self.class_embedding[:, :1, :] 
+        suffix = self.class_embedding[:, 1:, :] 
+        
+        # 拼接并在 77 处截断以符合 CLIP 的输入限制
+        x = torch.cat([prefix, ctx, suffix], dim=1)[:, :77, :]
+        
+        # 添加位置编码
+        x = x + self.text_model.positional_embedding.type(self.text_model.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        
+        layers = self.text_model.transformer.resblocks
+        total_layers = len(layers)
+        indices = [
+            int(total_layers * 1 / 4) - 1,
+            int(total_layers * 2 / 4) - 1,
+            int(total_layers * 3 / 4) - 1,
+            total_layers - 1
+        ]
+        
+        anchors_list = []
+        for i, layer in enumerate(layers):
+            x = layer(x)
+            if i in indices:
+                x_temp = x.permute(1, 0, 2)
+                
+                # 由于插入了 n_ctx 个 token，EOS 的位置向后移动了 n_ctx
+                eos_indices = self.tokenized_prompts.argmax(dim=-1) + n_ctx
+                eos_indices = torch.clamp(eos_indices, max=76) # 防止越界
+                
+                sent_emb = x_temp[torch.arange(x_temp.shape[0]), eos_indices]
+                
+                if i == total_layers - 1:
+                    sent_emb = self.text_model.ln_final(sent_emb).type(self.text_model.dtype)
+                    sent_emb = sent_emb @ self.text_model.text_projection
+                    
+                sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
+                anchors_list.append(sent_emb.float())
+                
+        return anchors_list
 
     def generate_text_anchors(self):
         """
