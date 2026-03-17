@@ -41,8 +41,7 @@ class MasterFedOur(object):
         # 恢复全局模型
 
         self.text_model, _ = self.load_clip_text_model()
-        self.anchor = self.generate_text_anchors()
-        self.output_dim = self.anchor[0].shape[-1] 
+        self.output_dim = self.text_model.text_projection.shape[1]
         conf.output_dim = self.output_dim
         self.conf = conf
 
@@ -58,6 +57,9 @@ class MasterFedOur(object):
             create_model.define_model(conf, to_consistent_model=False, client_id=i, arch=arch)
             for i,arch in enumerate(self.used_client_archs)
         ]
+
+        for i in range(len(self.client_models)): # 给所有客户端注入可训练提示词
+            self._inject_learnable_prompt(self.client_models[i][1])
 
         # 拷贝构建全局模型
 
@@ -586,66 +588,6 @@ class MasterFedOur(object):
         self.conf.logger.log(f"Master received all local models.")
         return flatten_local_models
 
-    def _fedavg(self, flatten_local_models, weights=None):
-        n_selected_clients = len(flatten_local_models)
-
-        if weights == None:
-            weights = [
-                torch.FloatTensor([1.0 / n_selected_clients]) for _ in range(n_selected_clients)
-            ]
-
-        # NOTE: the arch for different local models needs to be the same as the master model.
-        # retrieve the local models.
-        local_models = {}
-        for client_idx, flatten_local_model in flatten_local_models.items():
-            _arch = self.clientid2arch[client_idx]
-            _model = copy.deepcopy(self.client_models[_arch])
-            _model_state_dict = self.client_models[_arch].state_dict()
-            flatten_local_model.unpack(_model_state_dict.values())
-            _model.load_state_dict(_model_state_dict)
-            local_models[client_idx] = _model
-
-        # uniformly average the local models.
-        # assume we use the runtime stat from the last model.
-        _model = copy.deepcopy(_model)
-        local_states = [
-            ModuleState(copy.deepcopy(local_model.state_dict()))
-            for _, local_model in local_models.items()
-        ]
-        model_state = local_states[0] * weights[0]
-        for idx in range(1, len(local_states)):
-            model_state += local_states[idx] * weights[idx]
-        model_state.copy_to_module(_model)
-        return _model
-
-    def _avg_over_archs(self, flatten_local_models):
-        # get unique arch from this comm. round.
-        archs = set(
-            [
-                self.clientid2arch[client_idx]
-                for client_idx in flatten_local_models.keys()
-            ]
-        )
-
-        # average for each arch.
-        archs_fedavg_models = {}
-        for arch in archs:
-            # extract local_models from flatten_local_models.
-            _flatten_local_models = {}
-            for client_idx, flatten_local_model in flatten_local_models.items():
-                if self.clientid2arch[client_idx] == arch:
-                    _flatten_local_models[client_idx] = flatten_local_model
-
-            # average corresponding local models.
-            self.conf.logger.log(
-                f"Master uniformly average over {len(_flatten_local_models)} received models ({arch})."
-            )
-
-            fedavg_model = self._fedavg(flatten_local_models) # 平均算法
-            archs_fedavg_models[arch] = fedavg_model
-        return archs_fedavg_models
-
-
     def aggregate(self, flatten_local_models, selected_client_ids):
         # uniformly average local models with the same architecture.
         self.load_para2selectedmodels(flatten_local_models, selected_client_ids)    # 把收到参数放入self.clientmodels模型中
@@ -972,6 +914,18 @@ class MasterFedOur(object):
         checkpoint.save_arguments(self.conf)
         os.system(f"echo {self.conf.checkpoint_root} >> {self.conf.job_id}")
 
+    def _inject_learnable_prompt(self, model):
+        """
+        为 Master 端的模型注入与 Worker 结构完全一致的可学习提示词参数，
+        以确保 state_dict 的键值和 TensorBuffer 的长度完全匹配。
+        """
+        n_ctx = 16  # 必须与你在 Worker 中设置的 n_ctx 长度完全一致！
+        ctx_dim = self.text_model.token_embedding.weight.shape[1] # 通常是 512
+        
+        # 将参数作为 nn.Parameter 挂载到模型上
+        # 因为 Master 刚初始化时模型通常在 CPU 上，所以这里不用 to(device)
+        model.prompt_ctx = nn.Parameter(torch.empty(n_ctx, ctx_dim))
+        nn.init.normal_(model.prompt_ctx, std=0.02)
 
 def get_n_local_epoch(conf, n_participated):
     if conf.min_local_epochs is None:

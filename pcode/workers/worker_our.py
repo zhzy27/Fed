@@ -41,10 +41,10 @@ class WorkerFedOur(object):
         # create dataset (as well as the potential data_partitioner) for training.
         self.anchor_weight = torch.tensor([0.125, 0.25, 0.5, 1.0], device=self.device)
         self.text_model, _ = self.load_clip_text_model()
-        self.anchor = self.generate_text_anchors()
-        self.output_dim = self.anchor[0].shape[-1] 
+        # self.anchor = self.generate_text_anchors()
+        self.output_dim = self.text_model.text_projection.shape[1]
         
-        print(f"Anchors generated. Count: {len(self.anchor)}, Dim: {self.output_dim}")
+        
         conf.output_dim = self.output_dim 
         self.conf = conf
 
@@ -159,9 +159,12 @@ class WorkerFedOur(object):
         
         batch_size = len(self.class_embedding)
         n_ctx = self.model.prompt_ctx.shape[0]
-        
-        # 将 context 扩展到所有类别: [Num_Classes, n_ctx, Dim]
-        ctx = self.model.prompt_ctx.unsqueeze(0).expand(batch_size, -1, -1)
+
+
+
+        prompt_ctx_casted = self.model.prompt_ctx.to(self.text_model.dtype)     
+        # 使用转换后的 prompt_ctx_casted 进行扩展
+        ctx = prompt_ctx_casted.unsqueeze(0).expand(batch_size, -1, -1)
         
         # CLIP Token 结构分离
         # prefix: [SOS] token (索引 0)
@@ -352,8 +355,6 @@ class WorkerFedOur(object):
             # check if we need to terminate the training or not.
             if self._terminate_by_complete_training():
                 return
-    def extra_init(self):
-        pass
 
     def listen_to_master(self):
         # listen to master, related to the function `_activate_selected_clients` in `master.py`.
@@ -367,15 +368,21 @@ class WorkerFedOur(object):
         if self.conf.rank_list is not None:
             self.ratio_LR = self.conf.rank_list[self.conf.graph.client_id - 1]  # 取出属于自己的秩
 
+
         # once we receive the signal, we init for the local training.
         self.arch, self.model = create_model.define_model(
             self.conf, to_consistent_model=False, client_id=self.conf.graph.client_id
         ) # 获取模型
 
+
+        self.extra_init() # 将可训练提示词部分挂载到模型上
+
+        self.model.to("cpu")
+
         self.model_state_dict = self.model.state_dict()
         self.model_tb = TensorBuffer(list(self.model_state_dict.values())) # 将参数打包为一维参数，方便传输
 
-        self.extra_init()
+        
 
         self.metrics = create_metrics.Metrics(self.model, task="classification")
         dist.barrier()
@@ -437,6 +444,7 @@ class WorkerFedOur(object):
 
     def local_training_with_extra_calculate(self, loss, output, data_batch, feature=None, target=None, prototypes = None):
         # 1. 基础损失
+        self.anchor = self.get_dynamic_anchors()
         total_loss = loss + self.conf.meta_L2 * self.model.L2_decay()
 
         # 2. 计算层级锚点损失

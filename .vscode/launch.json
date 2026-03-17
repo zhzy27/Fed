@@ -10,8 +10,8 @@
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "args": [
-                "--arch", "resnet18", // 模型名称
-                "--complex_arch", "master=resnet18,worker=resnet18", //复杂和简单模型
+                "--arch", "federated_averaging_cnn", // 模型名称
+                "--complex_arch", "master=federated_averaging_cnn,worker=federated_averaging_cnn", //复杂和简单模型
                 "--method", "fedour", // 聚合算法
                 "--experiment", "fedour", 
                 "--group_norm_num_groups=16",  //组归一化个数
@@ -658,7 +658,7 @@ python run_gloo.py \
     --manual_seed 7 \
     --pn_normalize True \
     --same_seed_process False \
-    --port 51119 \
+    --port 51219 \
     --train_fast True \
     --meta True \
     --decom_rule 0 1 \
