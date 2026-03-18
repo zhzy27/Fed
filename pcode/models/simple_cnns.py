@@ -270,7 +270,7 @@ class MetaCNN(nn.Module):
                                         rank_rate=rank_rate, bias=w_fc_bias)
 
         # === Classifier (保持固定) ===
-        #  self.classifier = nn.Linear(512, self.num_classes, bias=w_fc_bias)
+        self.classifier = nn.Linear(512, self.num_classes, bias=w_fc_bias)
 
         # [ADD] 新增全局共享、可训练的 CLIP 适配层
         # 输入是 fc1 输出的 512 维特征，输出是对齐 CLIP 的 512 维特征
@@ -280,31 +280,20 @@ class MetaCNN(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(512, 512)
                 )
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.text_anchors = None
 
-    def _fix_module_order(self):
-        """强制固定网络层在 _modules 字典中的顺序，保证 state_dict 提取参数时的顺序永远一致"""
-        from collections import OrderedDict
-        
-        # 定义你网络初始化时标准的层级顺序
-        desired_order = [
-            'conv1', 'bn1', 'conv2', 'bn2', 'conv3', 'bn3', 'conv4', 'bn4', 
-            'conv5', 'bn5', 'pool', 'dropout', 'fc1', 'classifier', 'clip_adapter'
-        ]
-        
-        new_modules = OrderedDict()
-        
-        # 1. 按照预定顺序重新塞入字典
-        for name in desired_order:
-            if name in self._modules:
-                new_modules[name] = self._modules[name]
-                
-        # 2. 防呆设计：如果有其他没在列表里的模块，追加到最后
-        for name, module in self._modules.items():
-            if name not in desired_order:
-                new_modules[name] = module
-                
-        # 覆盖原有的无序字典
-        self._modules = new_modules
+    def set_text_anchors(self, dynamic_anchors_list):
+        """设置文本锚点特征 (CLIP 生成的文本特征)"""
+        # 1. get_dynamic_anchors 返回的是包含 4 个特征的列表
+        #    用于最终分类计算 logits 的，是最后一层的特征 (索引为 -1)
+        final_anchor = dynamic_anchors_list[-1]
+
+        # 2. 确保它是 Tensor 后，再进行 L2 归一化 (防呆设计)
+        final_anchor = F.normalize(final_anchor, p=2, dim=-1)
+
+        # 3. 赋值给普通的实例属性，保留计算图
+        self.text_anchors = final_anchor
     
     def forward(self, x):
         # Layer 1
@@ -331,6 +320,19 @@ class MetaCNN(nn.Module):
         # Dropout & Classifier
         x = self.dropout(x)
         # logits = self.classifier(x)
+        aligned_feature = self.clip_adapter(x) # 适配层对齐 CLIP 特征空间
+        aligned_feature = F.normalize(aligned_feature, p=2, dim=-1) # L2 归一化
+
+        if hasattr(self, 'text_anchors') and self.text_anchors is not None:
+            # 计算与文本锚点的相似度 (点积) 并应用温度缩放
+            # logits = self.logit_scale.exp() * aligned_feature @ self.text_anchors.T
+            current_device = aligned_feature.device
+            matched_anchors = self.text_anchors.to(current_device)
+            logit_scale = torch.clamp(self.logit_scale.exp(), max=100.0)
+            logits = logit_scale * aligned_feature @ matched_anchors.T
+        else:
+            print("Warning: Text anchors not set. Returning unscaled features as logits.")
+
 
         return x, logits
 

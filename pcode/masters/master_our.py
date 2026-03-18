@@ -44,6 +44,7 @@ class MasterFedOur(object):
         self.output_dim = self.text_model.text_projection.shape[1]
         conf.output_dim = self.output_dim
         self.conf = conf
+        self.prepare_text_embeddings()
 
         self.used_client_archs =[create_model.determine_arch(conf, client_id, use_complex_arch=True) for client_id in range(1, 1 + conf.n_clients)]  # 所有客户端模型架构名称
         
@@ -817,8 +818,83 @@ class MasterFedOur(object):
             # 将更新后的 state_dict 重新加载回模型（确保数据生效）
             target_model.load_state_dict(target_state_dict)
 
+    def get_dynamic_anchors(self):
+        """
+        每次迭代动态生成带有梯度的 Anchors。
+        流程: [SOS] + Learnable_Context + [Class_Name] + [EOS]
+        """
+        # 注意：这里一定不能用 torch.no_grad()，因为我们需要 prompt_ctx 的梯度！
+        self.text_model.eval() 
+        
+        batch_size = len(self.class_embedding)
+        n_ctx = self.master_model.prompt_ctx.shape[0]
 
 
+        device = self.class_embedding.device
+        prompt_ctx_casted = self.master_model.prompt_ctx.to(device = device, dtype = self.text_model.dtype)     
+        # 使用转换后的 prompt_ctx_casted 进行扩展
+        ctx = prompt_ctx_casted.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # CLIP Token 结构分离
+        # prefix: [SOS] token (索引 0)
+        # suffix: 类别名称 + [EOS] + 填充 (索引 1 开始)
+        prefix = self.class_embedding[:, :1, :] 
+        suffix = self.class_embedding[:, 1:, :] 
+        
+        # 拼接并在 77 处截断以符合 CLIP 的输入限制
+        x = torch.cat([prefix, ctx, suffix], dim=1)[:, :77, :]
+        
+        # 添加位置编码
+        x = x + self.text_model.positional_embedding.type(self.text_model.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        
+        layers = self.text_model.transformer.resblocks
+        total_layers = len(layers)
+        indices = [
+            int(total_layers * 1 / 4) - 1,
+            int(total_layers * 2 / 4) - 1,
+            int(total_layers * 3 / 4) - 1,
+            total_layers - 1
+        ]
+        
+        anchors_list = []
+        for i, layer in enumerate(layers):
+            x = layer(x)
+            if i in indices:
+                x_temp = x.permute(1, 0, 2)
+                
+                # 由于插入了 n_ctx 个 token，EOS 的位置向后移动了 n_ctx
+                eos_indices = self.tokenized_prompts.argmax(dim=-1) + n_ctx
+                eos_indices = torch.clamp(eos_indices, max=76) # 防止越界
+                
+                sent_emb = x_temp[torch.arange(x_temp.shape[0]), eos_indices]
+                
+                if i == total_layers - 1:
+                    sent_emb = self.text_model.ln_final(sent_emb).type(self.text_model.dtype)
+                    sent_emb = sent_emb @ self.text_model.text_projection
+                    
+                sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
+                anchors_list.append(sent_emb.float())
+                
+        return anchors_list
+    def prepare_text_embeddings(self):
+        """为 Master 准备静态的类别文本 Embedding"""
+        dataset_name = self.conf.data.lower()
+        # 这里简写了，请把你的 classes 列表完整放进来
+        if dataset_name == "cifar10":
+            classes = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"]
+        elif dataset_name == "cifar100":
+            classes = ['apple', 'aquarium fish', 'baby', 'bear', 'beaver'] # 替换为完整的 cifar100
+        else:
+            raise ValueError("Dataset not supported.")
+            
+        prompts = [f"{c}" for c in classes]
+        device = next(self.text_model.parameters()).device
+        self.tokenized_prompts = clip.tokenize(prompts).to(device)
+        
+        self.text_model.eval()
+        with torch.no_grad():
+            self.class_embedding = self.text_model.token_embedding(self.tokenized_prompts).type(self.text_model.dtype)
     def _aggregate_model_and_evaluate(self, flatten_local_models, selected_client_ids):
         # aggregate the local models.
         self.selected_client_ids = selected_client_ids
@@ -831,11 +907,8 @@ class MasterFedOur(object):
 
         self.master_model.load_state_dict(
             list(client_models.values())[0].state_dict()
-
-
-        
         )
-                
+        self.master_model.set_text_anchors(self.get_dynamic_anchors())  
         master_utils.do_validation( # 最终评估
             self.conf,
             self.coordinator,
