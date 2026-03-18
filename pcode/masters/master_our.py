@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import copy
+import gc
 
 import numpy as np
 import torch
@@ -426,6 +427,8 @@ class MasterFedOur(object):
             if comm_round == self.conf.n_comm_rounds:
             # if comm_round == 5:
                 self.visualize_global_features()
+            gc.collect()
+            torch.cuda.empty_cache()
         # formally stop the training (the master has finished all communication rounds).
         dist.barrier()
         self._finishing()
