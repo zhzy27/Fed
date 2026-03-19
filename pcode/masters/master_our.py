@@ -901,17 +901,40 @@ class MasterFedOur(object):
     def _aggregate_model_and_evaluate(self, flatten_local_models, selected_client_ids):
         # aggregate the local models.
         self.selected_client_ids = selected_client_ids
+        
+        # 1. 正常计算本轮选中的客户端的平均模型
         aggregated_model = self.aggregate(
             flatten_local_models,
             selected_client_ids
-        ) # 计算平均后的模型
+        ) 
 
-        client_models = {0: aggregated_model}
+        # ==================== [核心修改：EMA 迭代聚合逻辑] ====================
+        
+        # 定义本轮新模型的更新步长 (beta)，范围通常在 0.1 ~ 0.4 之间
+        # 0.2 意味着：新全局模型 = 80% 上一轮老模型 + 20% 本轮新聚合模型
+        beta = 0.2  
+        
+        old_state_dict = self.master_model.state_dict()
+        new_state_dict = aggregated_model.state_dict()
 
-        self.master_model.load_state_dict(
-            list(client_models.values())[0].state_dict()
-        )
+        # 只有在第 2 轮及以后才进行加权融合。
+        # 第一轮 (comm_round == 1) 必须 100% 接受新模型，否则会一直保留随机初始化的参数！
+        if self.conf.graph.comm_round > 1:
+            for key in old_state_dict:
+                # 只对浮点数参数（如 weights, biases, prompt_ctx）进行平滑加权
+                if old_state_dict[key].is_floating_point():
+                    new_state_dict[key] = (1.0 - beta) * old_state_dict[key] + beta * new_state_dict[key]
+                else:
+                    # 对于非浮点数（如 BatchNorm 的 num_batches_tracked），通常直接保留本轮的新值即可
+                    pass 
+                    
+        # 将融合后的平滑参数加载到全局模型中
+        self.master_model.load_state_dict(new_state_dict)
+        # =======================================================================
+
+        # 为全局模型挂载文本锚点 (保持你原有的逻辑)
         self.master_model.set_text_anchors(self.get_dynamic_anchors())  
+
         master_utils.do_validation( # 最终评估
             self.conf,
             self.coordinator,
@@ -922,16 +945,9 @@ class MasterFedOur(object):
             label=f"aggregated_test_loader_0",
         )
 
-        # self.conf.train_fast=False
-        
+        # ... 下面的 client 评估和 early stopping 等逻辑保持完全不变 ...
         if not self.conf.train_fast:  # test all the selected_clients
             for client_idx in selected_client_ids:
-                # _arch = self.clientid2arch[client_idx]
-                # _model_state_dict = copy.deepcopy(self.client_models[client_idx][1].state_dict())
-                # flatten_local_model.unpack(_model_state_dict.values())
-                # real_arch = _arch[1] if isinstance(_arch, tuple) else _arch
-                # _, test_model = create_model.define_model(self.conf, to_consistent_model=False, client_id=client_idx , arch=real_arch)
-                # test_model.load_state_dict(_model_state_dict)
                 test_model = copy.deepcopy(self.client_models[client_idx][1])
                 master_utils.do_validation(
                     conf=self.conf,
@@ -943,7 +959,6 @@ class MasterFedOur(object):
                     label=f"aggregated_test_loader_{client_idx}",
                 )
             self.additional_validation()
-
 
         torch.cuda.empty_cache()
     def additional_validation(self):
