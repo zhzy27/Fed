@@ -280,6 +280,13 @@ class MetaCNN(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(512, 512)
                 )
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+    def set_text_anchors(self, anchors):
+        """设置文本锚点特征 (CLIP 生成的文本特征)"""
+        anchors = F.normalize(anchors,p=2, dim=-1) # L2 归一化
+
+        self.register_buffer('text_anchors', anchors, persistent=False) # 不更新也不打包传
 
     def forward(self, x):
         # Layer 1
@@ -305,9 +312,18 @@ class MetaCNN(nn.Module):
         
         # Dropout & Classifier
         x = self.dropout(x)
-        logits = self.classifier(x)
+        aligned_feature = self.clip_adapter(x) # 适配层对齐 CLIP 特征空间
+        aligned_feature = F.normalize(aligned_feature, p=2, dim=-1) # L2 归一化
 
-        return x, logits
+        if hasattr(self, 'text_anchors') and self.text_anchors is not None:
+            # 计算与文本锚点的相似度 (点积) 并应用温度缩放
+            # logits = self.logit_scale.exp() * aligned_feature @ self.text_anchors.T
+            logit_scale = torch.clamp(self.logit_scale.exp(), max=100.0)
+            logits = logit_scale * aligned_feature @ self.text_anchors.T
+        else:
+            print("Warning: Text anchors not set. Returning unscaled features as logits.")
+
+        return aligned_feature, logits
 
     # === 模型分解与恢复方法 ===
 

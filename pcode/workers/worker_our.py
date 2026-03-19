@@ -43,7 +43,7 @@ class WorkerFedOur(object):
         self.text_model, _ = self.load_clip_text_model()
         self.anchor = self.generate_text_anchors()
         self.output_dim = self.anchor[0].shape[-1] 
-        
+
         print(f"Anchors generated. Count: {len(self.anchor)}, Dim: {self.output_dim}")
         conf.output_dim = self.output_dim 
         self.conf = conf
@@ -267,7 +267,7 @@ class WorkerFedOur(object):
             if self._terminate_by_complete_training():
                 return
     def extra_init(self):
-        pass
+        self.model.set_text_anchors(self.anchor[-1])
 
     def listen_to_master(self):
         # listen to master, related to the function `_activate_selected_clients` in `master.py`.
@@ -353,94 +353,94 @@ class WorkerFedOur(object):
         # 1. 基础损失
         total_loss = loss + self.conf.meta_L2 * self.model.L2_decay()
 
-        # 2. 计算层级锚点损失
-        # 检查是否开启对齐 (可以通过 output 里的 stage_features 是否为空，或者 check use_align)
-        # 注意：这里需要确保你已经正确解包了 output，例如 x, logits = output
-        # 或者你现在的 output 就是 logits，而 stage_features 存在 self.model.stage_features 里
-        if "resnet" in self.conf.arch:
-            if self.model.use_align and hasattr(self, 'anchor'):
+        # # 2. 计算层级锚点损失
+        # # 检查是否开启对齐 (可以通过 output 里的 stage_features 是否为空，或者 check use_align)
+        # # 注意：这里需要确保你已经正确解包了 output，例如 x, logits = output
+        # # 或者你现在的 output 就是 logits，而 stage_features 存在 self.model.stage_features 里
+        # if "resnet" in self.conf.arch:
+        #     if self.model.use_align and hasattr(self, 'anchor'):
                 
-                # [关键步骤 A] 获取当前 Batch 的标签
-                if "target" in data_batch:
-                    current_target = data_batch["target"]
-                elif target is not None:
-                    current_target = target.to(self.device)
-                else:
-                    raise ValueError("local_training_with_extra_calculate") # 没标签没法算，直接返回
+        #         # [关键步骤 A] 获取当前 Batch 的标签
+        #         if "target" in data_batch:
+        #             current_target = data_batch["target"]
+        #         elif target is not None:
+        #             current_target = target.to(self.device)
+        #         else:
+        #             raise ValueError("local_training_with_extra_calculate") # 没标签没法算，直接返回
 
-                # [关键步骤 B] 根据标签挑选锚点
-                # self.anchor 是 list: [Tensor(10, 512), Tensor(10, 512)...]
-                # 我们需要构造 batch_anchors: [Tensor(B, 512), Tensor(B, 512)...]
-                current_batch_anchors = []
-                for layer_idx in range(4):
-                    # 利用高级索引，选出当前 target 对应的锚点行
-                    # layer_anchor shape: [Batch_Size, Dim]
-                    layer_anchor = self.anchor[layer_idx][current_target]
-                    current_batch_anchors.append(layer_anchor)
+        #         # [关键步骤 B] 根据标签挑选锚点
+        #         # self.anchor 是 list: [Tensor(10, 512), Tensor(10, 512)...]
+        #         # 我们需要构造 batch_anchors: [Tensor(B, 512), Tensor(B, 512)...]
+        #         current_batch_anchors = []
+        #         for layer_idx in range(4):
+        #             # 利用高级索引，选出当前 target 对应的锚点行
+        #             # layer_anchor shape: [Batch_Size, Dim]
+        #             layer_anchor = self.anchor[layer_idx][current_target]
+        #             current_batch_anchors.append(layer_anchor)
 
-                # [关键步骤 C] 传入处理好的 Batch 锚点
-                # 返回的是 shape 为 [4] 的 tensor，包含 4 个阶段的 loss
-                loss_vec = self.model.calculate_stage_anchor_loss(current_batch_anchors)
+        #         # [关键步骤 C] 传入处理好的 Batch 锚点
+        #         # 返回的是 shape 为 [4] 的 tensor，包含 4 个阶段的 loss
+        #         loss_vec = self.model.calculate_stage_anchor_loss(current_batch_anchors)
                 
-                # [关键步骤 D] 求和并加权
-                # 因为 loss_vec 是 [L1, L2, L3, L4]，你需要把它变成一个标量才能加到 total_loss
-                weight_tensor = torch.tensor(self.anchor_weight, device=loss_vec.device, dtype=loss_vec.dtype)
-                anchor_loss_scalar = torch.sum(loss_vec * weight_tensor)
+        #         # [关键步骤 D] 求和并加权
+        #         # 因为 loss_vec 是 [L1, L2, L3, L4]，你需要把它变成一个标量才能加到 total_loss
+        #         weight_tensor = torch.tensor(self.anchor_weight, device=loss_vec.device, dtype=loss_vec.dtype)
+        #         anchor_loss_scalar = torch.sum(loss_vec * weight_tensor)
                 
-                total_loss += self.conf.anchor_loss * anchor_loss_scalar
-        elif "cnn" in self.conf.arch:
-            if "target" in data_batch:
-                current_target = data_batch["target"]
-            elif target is not None:
-                current_target = target.to(self.device)
-            else:
-                raise ValueError("local_training_with_extra_calculate")
-            sleleted_anchor = self.anchor[-1][current_target]
-            aligned_feature = self.model.clip_adapter(feature)
-            aligned_feature = F.normalize(aligned_feature, p=2,dim=1)
-            mse_loss = F.mse_loss(aligned_feature, sleleted_anchor)
-            total_loss = total_loss + 0.75*mse_loss
+        #         total_loss += self.conf.anchor_loss * anchor_loss_scalar
+        # elif "cnn" in self.conf.arch:
+        #     if "target" in data_batch:
+        #         current_target = data_batch["target"]
+        #     elif target is not None:
+        #         current_target = target.to(self.device)
+        #     else:
+        #         raise ValueError("local_training_with_extra_calculate")
+        #     sleleted_anchor = self.anchor[-1][current_target]
+        #     aligned_feature = self.model.clip_adapter(feature)
+        #     aligned_feature = F.normalize(aligned_feature, p=2,dim=1)
+        #     mse_loss = F.mse_loss(aligned_feature, sleleted_anchor)
+        #     total_loss = total_loss + 0.75*mse_loss
 
-        if prototypes is not None and len(prototypes) > 1:
-            if "target" in data_batch:
-                current_target = data_batch["target"]
-            else:
-                current_target = target.to(self.device)
+        # if prototypes is not None and len(prototypes) > 1:
+        #     if "target" in data_batch:
+        #         current_target = data_batch["target"]
+        #     else:
+        #         current_target = target.to(self.device)
 
-            # a. 提取所有的原型键，并排序保证顺序一致
-            proto_keys = sorted(list(prototypes.keys()))
-            proto_tensor = torch.stack([prototypes[k] for k in proto_keys]).to(self.device)
+        #     # a. 提取所有的原型键，并排序保证顺序一致
+        #     proto_keys = sorted(list(prototypes.keys()))
+        #     proto_tensor = torch.stack([prototypes[k] for k in proto_keys]).to(self.device)
 
-            # b. 特征与原型做 L2 归一化
-            norm_feature = F.normalize(feature, p=2, dim=1)
-            norm_proto = F.normalize(proto_tensor, p=2, dim=1)
+        #     # b. 特征与原型做 L2 归一化
+        #     norm_feature = F.normalize(feature, p=2, dim=1)
+        #     norm_proto = F.normalize(proto_tensor, p=2, dim=1)
 
-            # c. 计算余弦相似度矩阵
-            temperature = getattr(self.conf, 'proto_temp', 0.5) 
-            sim_matrix = torch.matmul(norm_feature, norm_proto.T) / temperature
+        #     # c. 计算余弦相似度矩阵
+        #     temperature = getattr(self.conf, 'proto_temp', 0.5) 
+        #     sim_matrix = torch.matmul(norm_feature, norm_proto.T) / temperature
 
-            # d. 制作目标标签映射 (因为交叉熵的 target 必须是 0 到 C-1 的连续索引)
-            target_to_idx = {cls_name: idx for idx, cls_name in enumerate(proto_keys)}
+        #     # d. 制作目标标签映射 (因为交叉熵的 target 必须是 0 到 C-1 的连续索引)
+        #     target_to_idx = {cls_name: idx for idx, cls_name in enumerate(proto_keys)}
             
-            # 过滤掉万一没计算出原型的异常类 (稳健性设计)
-            valid_mask = torch.tensor([t.item() in target_to_idx for t in current_target], dtype=torch.bool, device=self.device)
+        #     # 过滤掉万一没计算出原型的异常类 (稳健性设计)
+        #     valid_mask = torch.tensor([t.item() in target_to_idx for t in current_target], dtype=torch.bool, device=self.device)
             
-            if valid_mask.any():
-                valid_sim_matrix = sim_matrix[valid_mask]
-                valid_targets = current_target[valid_mask]
+        #     if valid_mask.any():
+        #         valid_sim_matrix = sim_matrix[valid_mask]
+        #         valid_targets = current_target[valid_mask]
                 
-                mapped_targets = torch.tensor(
-                    [target_to_idx[t.item()] for t in valid_targets], 
-                    device=self.device
-                )
+        #         mapped_targets = torch.tensor(
+        #             [target_to_idx[t.item()] for t in valid_targets], 
+        #             device=self.device
+        #         )
 
-                # e. 计算交叉熵损失 (拉近同类，推远异类)
-                contrastive_loss = F.cross_entropy(valid_sim_matrix, mapped_targets)
+        #         # e. 计算交叉熵损失 (拉近同类，推远异类)
+        #         contrastive_loss = F.cross_entropy(valid_sim_matrix, mapped_targets)
 
-                # f. 累加总损失
-                proto_weight = getattr(self.conf, 'proto_contrastive_weight', 1.0)
-                proto_weight = 0
-                total_loss += proto_weight * contrastive_loss
+        #         # f. 累加总损失
+        #         proto_weight = getattr(self.conf, 'proto_contrastive_weight', 1.0)
+        #         proto_weight = 0
+        #         total_loss += proto_weight * contrastive_loss
 
         return total_loss
 

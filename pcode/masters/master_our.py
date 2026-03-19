@@ -58,6 +58,7 @@ class MasterFedOur(object):
         # 拷贝构建全局模型
 
         self.master_model = copy.deepcopy(self.client_models[0][1])
+        self.master_model.set_text_anchors(self.anchor[-1])
         if "resnet" in self.conf.arch:
             for m in self.master_model.modules():
                     if isinstance(m, MetaBasicBlock):
