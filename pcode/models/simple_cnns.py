@@ -290,7 +290,7 @@ class MetaCNN(nn.Module):
         final_anchor = dynamic_anchors_list[-1]
 
         # 2. 确保它是 Tensor 后，再进行 L2 归一化 (防呆设计)
-        final_anchor = F.normalize(final_anchor, p=2, dim=-1)
+        # final_anchor = F.normalize(final_anchor, p=2, dim=-1)
 
         # 3. 赋值给普通的实例属性，保留计算图
         self.text_anchors = final_anchor
@@ -321,15 +321,15 @@ class MetaCNN(nn.Module):
         x = self.dropout(x)
         # logits = self.classifier(x)
         aligned_feature = self.clip_adapter(x) # 适配层对齐 CLIP 特征空间
-        aligned_feature = F.normalize(aligned_feature, p=2, dim=-1) # L2 归一化
+        # aligned_feature = F.normalize(aligned_feature, p=2, dim=-1) # L2 归一化
 
         if hasattr(self, 'text_anchors') and self.text_anchors is not None:
             # 计算与文本锚点的相似度 (点积) 并应用温度缩放
             # logits = self.logit_scale.exp() * aligned_feature @ self.text_anchors.T
             current_device = aligned_feature.device
             matched_anchors = self.text_anchors.to(current_device)
-            logit_scale = torch.clamp(self.logit_scale.exp(), max=100.0)
-            logits = logit_scale * aligned_feature @ matched_anchors.T
+            # logit_scale = torch.clamp(self.logit_scale.exp(), max=100.0)
+            logits = aligned_feature @ matched_anchors.T
         else:
             print("Warning: Text anchors not set. Returning unscaled features as logits.")
 

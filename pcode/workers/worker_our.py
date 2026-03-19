@@ -204,7 +204,7 @@ class WorkerFedOur(object):
                     sent_emb = self.text_model.ln_final(sent_emb).type(self.text_model.dtype)
                     sent_emb = sent_emb @ self.text_model.text_projection
                     
-                sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
+                # sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
                 anchors_list.append(sent_emb.float())
                 
         return anchors_list
