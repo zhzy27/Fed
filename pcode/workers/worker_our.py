@@ -495,46 +495,46 @@ class WorkerFedOur(object):
         #     mse_loss = F.mse_loss(aligned_feature, sleleted_anchor)
         #     total_loss = total_loss + 0.75*mse_loss
 
-        # if prototypes is not None and len(prototypes) > 1:
-        #     if "target" in data_batch:
-        #         current_target = data_batch["target"]
-        #     else:
-        #         current_target = target.to(self.device)
+        if prototypes is not None and len(prototypes) > 1:
+            if "target" in data_batch:
+                current_target = data_batch["target"]
+            else:
+                current_target = target.to(self.device)
 
-        #     # a. 提取所有的原型键，并排序保证顺序一致
-        #     proto_keys = sorted(list(prototypes.keys()))
-        #     proto_tensor = torch.stack([prototypes[k] for k in proto_keys]).to(self.device)
+            # a. 提取所有的原型键，并排序保证顺序一致
+            proto_keys = sorted(list(prototypes.keys()))
+            proto_tensor = torch.stack([prototypes[k] for k in proto_keys]).to(self.device)
 
-        #     # b. 特征与原型做 L2 归一化
-        #     norm_feature = F.normalize(feature, p=2, dim=1)
-        #     norm_proto = F.normalize(proto_tensor, p=2, dim=1)
+            # b. 特征与原型做 L2 归一化
+            norm_feature = F.normalize(feature, p=2, dim=1)
+            norm_proto = F.normalize(proto_tensor, p=2, dim=1)
 
-        #     # c. 计算余弦相似度矩阵
-        #     temperature = getattr(self.conf, 'proto_temp', 0.5) 
-        #     sim_matrix = torch.matmul(norm_feature, norm_proto.T) / temperature
+            # c. 计算余弦相似度矩阵
+            temperature = getattr(self.conf, 'proto_temp', 0.5) 
+            sim_matrix = torch.matmul(norm_feature, norm_proto.T) / temperature
 
-        #     # d. 制作目标标签映射 (因为交叉熵的 target 必须是 0 到 C-1 的连续索引)
-        #     target_to_idx = {cls_name: idx for idx, cls_name in enumerate(proto_keys)}
+            # d. 制作目标标签映射 (因为交叉熵的 target 必须是 0 到 C-1 的连续索引)
+            target_to_idx = {cls_name: idx for idx, cls_name in enumerate(proto_keys)}
             
-        #     # 过滤掉万一没计算出原型的异常类 (稳健性设计)
-        #     valid_mask = torch.tensor([t.item() in target_to_idx for t in current_target], dtype=torch.bool, device=self.device)
+            # 过滤掉万一没计算出原型的异常类 (稳健性设计)
+            valid_mask = torch.tensor([t.item() in target_to_idx for t in current_target], dtype=torch.bool, device=self.device)
             
-        #     if valid_mask.any():
-        #         valid_sim_matrix = sim_matrix[valid_mask]
-        #         valid_targets = current_target[valid_mask]
+            if valid_mask.any():
+                valid_sim_matrix = sim_matrix[valid_mask]
+                valid_targets = current_target[valid_mask]
                 
-        #         mapped_targets = torch.tensor(
-        #             [target_to_idx[t.item()] for t in valid_targets], 
-        #             device=self.device
-        #         )
+                mapped_targets = torch.tensor(
+                    [target_to_idx[t.item()] for t in valid_targets], 
+                    device=self.device
+                )
 
-        #         # e. 计算交叉熵损失 (拉近同类，推远异类)
-        #         contrastive_loss = F.cross_entropy(valid_sim_matrix, mapped_targets)
+                # e. 计算交叉熵损失 (拉近同类，推远异类)
+                contrastive_loss = F.cross_entropy(valid_sim_matrix, mapped_targets)
 
-        #         # f. 累加总损失
-        #         proto_weight = getattr(self.conf, 'proto_contrastive_weight', 1.0)
-        #         proto_weight = 0
-        #         total_loss += proto_weight * contrastive_loss
+                # f. 累加总损失
+                proto_weight = getattr(self.conf, 'proto_contrastive_weight', 1.0)
+                proto_weight = 0
+                total_loss += proto_weight * contrastive_loss
 
         return total_loss
 
@@ -582,7 +582,8 @@ class WorkerFedOur(object):
         self.prepare_train() # 初始化指标追踪器，优化器等
         # entering local updates and will finish only after reaching the expected local_n_epochs.
         while True:
-            # prototypes = self.get_proto()
+            self.model.set_text_anchors(self.get_dynamic_anchors())
+            prototypes = self.get_proto()
             for _input, _target in self.train_loader:
 
                 self.model.set_text_anchors(self.get_dynamic_anchors())
@@ -598,7 +599,7 @@ class WorkerFedOur(object):
                     loss, performance, output, feature = self._inference(data_batch)    # 前向传播
 
                 with self.timer("extra_forward_pass", epoch=self.scheduler.epoch_):
-                    loss = self.local_training_with_extra_calculate(loss, output, data_batch, feature=feature,target = _target)  # 计算L2损失
+                    loss = self.local_training_with_extra_calculate(loss, output, data_batch, feature=feature,target = _target, prototypes=prototypes)  # 计算L2损失
                 with self.timer("backward_pass", epoch=self.scheduler.epoch_):
                     self.optimizer.zero_grad()
                     loss.backward()
