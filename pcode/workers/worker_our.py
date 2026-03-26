@@ -41,10 +41,10 @@ class WorkerFedOur(object):
         # create dataset (as well as the potential data_partitioner) for training.
         self.anchor_weight = torch.tensor([0.125, 0.25, 0.5, 1.0], device=self.device)
         self.text_model, _ = self.load_clip_text_model()
-        self.anchor = self.generate_text_anchors()
-        self.output_dim = self.anchor[0].shape[-1] 
+        # self.anchor = self.generate_text_anchors()
+        self.output_dim = self.text_model.text_projection.shape[1]
         
-        print(f"Anchors generated. Count: {len(self.anchor)}, Dim: {self.output_dim}")
+        
         conf.output_dim = self.output_dim 
         self.conf = conf
 
@@ -71,6 +71,36 @@ class WorkerFedOur(object):
         conf.logger.log(
             f"Worker-{conf.graph.worker_id} initialized dataset/criterion.\n"
         )   # 打印当前的进程编号
+
+    def extra_init(self):
+        # 1. 冻结 CLIP 文本模型的自身参数
+        for param in self.text_model.parameters():
+            param.requires_grad = False
+            
+        # 2. 初始化可学习的 Prompt (Context Tokens)
+        n_ctx = 16  # 你可以调节提示词的长度 (如 4, 8, 16)
+        ctx_dim = self.text_model.token_embedding.weight.shape[1] # 通常是 512
+        
+        # 将参数挂载到 self.model 上，这样联邦通信和优化器都能自动接管
+        self.model.prompt_ctx = nn.Parameter(torch.empty(n_ctx, ctx_dim).to(self.device))
+        nn.init.normal_(self.model.prompt_ctx, std=0.02)
+        
+        # 3. 预先处理好类名的 Token (不带 "a photo of a")
+        # 假设你原来的 data_classes_registry 依然可用
+        dataset_name = self.conf.data.lower()
+        if dataset_name == "cifar10":
+            classes = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"]
+        elif dataset_name == "cifar100":
+            classes = ['apple', 'aquarium fish', 'baby', 'bear', 'beaver'] # 填入你的 cifar100 完整列表
+        else:
+            raise ValueError("Dataset not supported.")
+            
+        prompts = [f"{c}" for c in classes] # 只保留类别名
+        self.tokenized_prompts = clip.tokenize(prompts).to(self.device)
+        
+        # 预先提取类别名的基础 Embedding（节省每次前向传播的时间）
+        with torch.no_grad():
+            self.class_embedding = self.text_model.token_embedding(self.tokenized_prompts).type(self.text_model.dtype)
 
 
     def load_clip_text_model(self, model_name="ViT-B/32", save_dir="./model_state/"):
@@ -119,6 +149,65 @@ class WorkerFedOur(object):
 
         return model, device
     
+    def get_dynamic_anchors(self):
+        """
+        每次迭代动态生成带有梯度的 Anchors。
+        流程: [SOS] + Learnable_Context + [Class_Name] + [EOS]
+        """
+        # 注意：这里一定不能用 torch.no_grad()，因为我们需要 prompt_ctx 的梯度！
+        self.text_model.eval() 
+        
+        batch_size = len(self.class_embedding)
+        n_ctx = self.model.prompt_ctx.shape[0]
+
+
+
+        prompt_ctx_casted = self.model.prompt_ctx.to(self.text_model.dtype)     
+        # 使用转换后的 prompt_ctx_casted 进行扩展
+        ctx = prompt_ctx_casted.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # CLIP Token 结构分离
+        # prefix: [SOS] token (索引 0)
+        # suffix: 类别名称 + [EOS] + 填充 (索引 1 开始)
+        prefix = self.class_embedding[:, :1, :] 
+        suffix = self.class_embedding[:, 1:, :] 
+        
+        # 拼接并在 77 处截断以符合 CLIP 的输入限制
+        x = torch.cat([prefix, ctx, suffix], dim=1)[:, :77, :]
+        
+        # 添加位置编码
+        x = x + self.text_model.positional_embedding.type(self.text_model.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        
+        layers = self.text_model.transformer.resblocks
+        total_layers = len(layers)
+        indices = [
+            int(total_layers * 1 / 4) - 1,
+            int(total_layers * 2 / 4) - 1,
+            int(total_layers * 3 / 4) - 1,
+            total_layers - 1
+        ]
+        
+        anchors_list = []
+        for i, layer in enumerate(layers):
+            x = layer(x)
+            if i in indices:
+                x_temp = x.permute(1, 0, 2)
+                
+                # 由于插入了 n_ctx 个 token，EOS 的位置向后移动了 n_ctx
+                eos_indices = self.tokenized_prompts.argmax(dim=-1) + n_ctx
+                eos_indices = torch.clamp(eos_indices, max=76) # 防止越界
+                
+                sent_emb = x_temp[torch.arange(x_temp.shape[0]), eos_indices]
+                
+                if i == total_layers - 1:
+                    sent_emb = self.text_model.ln_final(sent_emb).type(self.text_model.dtype)
+                    sent_emb = sent_emb @ self.text_model.text_projection
+                    
+                # sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
+                anchors_list.append(sent_emb.float())
+                
+        return anchors_list
 
     def generate_text_anchors(self):
         """
@@ -266,8 +355,6 @@ class WorkerFedOur(object):
             # check if we need to terminate the training or not.
             if self._terminate_by_complete_training():
                 return
-    def extra_init(self):
-        pass
 
     def listen_to_master(self):
         # listen to master, related to the function `_activate_selected_clients` in `master.py`.
@@ -281,15 +368,21 @@ class WorkerFedOur(object):
         if self.conf.rank_list is not None:
             self.ratio_LR = self.conf.rank_list[self.conf.graph.client_id - 1]  # 取出属于自己的秩
 
+
         # once we receive the signal, we init for the local training.
         self.arch, self.model = create_model.define_model(
             self.conf, to_consistent_model=False, client_id=self.conf.graph.client_id
         ) # 获取模型
 
+
+        self.extra_init() # 将可训练提示词部分挂载到模型上
+
+        self.model.to("cpu")
+
         self.model_state_dict = self.model.state_dict()
         self.model_tb = TensorBuffer(list(self.model_state_dict.values())) # 将参数打包为一维参数，方便传输
 
-        self.extra_init()
+        
 
         self.metrics = create_metrics.Metrics(self.model, task="classification")
         dist.barrier()
@@ -351,55 +444,56 @@ class WorkerFedOur(object):
 
     def local_training_with_extra_calculate(self, loss, output, data_batch, feature=None, target=None, prototypes = None):
         # 1. 基础损失
+        # self.anchor = self.get_dynamic_anchors()
         total_loss = loss + self.conf.meta_L2 * self.model.L2_decay()
 
-        # 2. 计算层级锚点损失
-        # 检查是否开启对齐 (可以通过 output 里的 stage_features 是否为空，或者 check use_align)
-        # 注意：这里需要确保你已经正确解包了 output，例如 x, logits = output
-        # 或者你现在的 output 就是 logits，而 stage_features 存在 self.model.stage_features 里
-        if "resnet" in self.conf.arch:
-            if self.model.use_align and hasattr(self, 'anchor'):
+        # # 2. 计算层级锚点损失
+        # # 检查是否开启对齐 (可以通过 output 里的 stage_features 是否为空，或者 check use_align)
+        # # 注意：这里需要确保你已经正确解包了 output，例如 x, logits = output
+        # # 或者你现在的 output 就是 logits，而 stage_features 存在 self.model.stage_features 里
+        # if "resnet" in self.conf.arch:
+        #     if self.model.use_align and hasattr(self, 'anchor'):
                 
-                # [关键步骤 A] 获取当前 Batch 的标签
-                if "target" in data_batch:
-                    current_target = data_batch["target"]
-                elif target is not None:
-                    current_target = target.to(self.device)
-                else:
-                    raise ValueError("local_training_with_extra_calculate") # 没标签没法算，直接返回
+        #         # [关键步骤 A] 获取当前 Batch 的标签
+        #         if "target" in data_batch:
+        #             current_target = data_batch["target"]
+        #         elif target is not None:
+        #             current_target = target.to(self.device)
+        #         else:
+        #             raise ValueError("local_training_with_extra_calculate") # 没标签没法算，直接返回
 
-                # [关键步骤 B] 根据标签挑选锚点
-                # self.anchor 是 list: [Tensor(10, 512), Tensor(10, 512)...]
-                # 我们需要构造 batch_anchors: [Tensor(B, 512), Tensor(B, 512)...]
-                current_batch_anchors = []
-                for layer_idx in range(4):
-                    # 利用高级索引，选出当前 target 对应的锚点行
-                    # layer_anchor shape: [Batch_Size, Dim]
-                    layer_anchor = self.anchor[layer_idx][current_target]
-                    current_batch_anchors.append(layer_anchor)
+        #         # [关键步骤 B] 根据标签挑选锚点
+        #         # self.anchor 是 list: [Tensor(10, 512), Tensor(10, 512)...]
+        #         # 我们需要构造 batch_anchors: [Tensor(B, 512), Tensor(B, 512)...]
+        #         current_batch_anchors = []
+        #         for layer_idx in range(4):
+        #             # 利用高级索引，选出当前 target 对应的锚点行
+        #             # layer_anchor shape: [Batch_Size, Dim]
+        #             layer_anchor = self.anchor[layer_idx][current_target]
+        #             current_batch_anchors.append(layer_anchor)
 
-                # [关键步骤 C] 传入处理好的 Batch 锚点
-                # 返回的是 shape 为 [4] 的 tensor，包含 4 个阶段的 loss
-                loss_vec = self.model.calculate_stage_anchor_loss(current_batch_anchors)
+        #         # [关键步骤 C] 传入处理好的 Batch 锚点
+        #         # 返回的是 shape 为 [4] 的 tensor，包含 4 个阶段的 loss
+        #         loss_vec = self.model.calculate_stage_anchor_loss(current_batch_anchors)
                 
-                # [关键步骤 D] 求和并加权
-                # 因为 loss_vec 是 [L1, L2, L3, L4]，你需要把它变成一个标量才能加到 total_loss
-                weight_tensor = torch.tensor(self.anchor_weight, device=loss_vec.device, dtype=loss_vec.dtype)
-                anchor_loss_scalar = torch.sum(loss_vec * weight_tensor)
+        #         # [关键步骤 D] 求和并加权
+        #         # 因为 loss_vec 是 [L1, L2, L3, L4]，你需要把它变成一个标量才能加到 total_loss
+        #         weight_tensor = torch.tensor(self.anchor_weight, device=loss_vec.device, dtype=loss_vec.dtype)
+        #         anchor_loss_scalar = torch.sum(loss_vec * weight_tensor)
                 
-                total_loss += self.conf.anchor_loss * anchor_loss_scalar
-        elif "cnn" in self.conf.arch:
-            if "target" in data_batch:
-                current_target = data_batch["target"]
-            elif target is not None:
-                current_target = target.to(self.device)
-            else:
-                raise ValueError("local_training_with_extra_calculate")
-            sleleted_anchor = self.anchor[-1][current_target]
-            aligned_feature = self.model.clip_adapter(feature)
-            aligned_feature = F.normalize(aligned_feature, p=2,dim=1)
-            mse_loss = F.mse_loss(aligned_feature, sleleted_anchor)
-            total_loss = total_loss + 0.75*mse_loss
+        #         total_loss += self.conf.anchor_loss * anchor_loss_scalar
+        # elif "cnn" in self.conf.arch:
+        #     if "target" in data_batch:
+        #         current_target = data_batch["target"]
+        #     elif target is not None:
+        #         current_target = target.to(self.device)
+        #     else:
+        #         raise ValueError("local_training_with_extra_calculate")
+        #     sleleted_anchor = self.anchor[-1][current_target]
+        #     aligned_feature = self.model.clip_adapter(feature)
+        #     aligned_feature = F.normalize(aligned_feature, p=2,dim=1)
+        #     mse_loss = F.mse_loss(aligned_feature, sleleted_anchor)
+        #     total_loss = total_loss + 0.75*mse_loss
 
         if prototypes is not None and len(prototypes) > 1:
             if "target" in data_batch:
@@ -488,8 +582,11 @@ class WorkerFedOur(object):
         self.prepare_train() # 初始化指标追踪器，优化器等
         # entering local updates and will finish only after reaching the expected local_n_epochs.
         while True:
+            self.model.set_text_anchors(self.get_dynamic_anchors())
             prototypes = self.get_proto()
             for _input, _target in self.train_loader:
+
+                self.model.set_text_anchors(self.get_dynamic_anchors())
 
                 # load data
                 with self.timer("load_data", epoch=self.scheduler.epoch_): # 数据统计
@@ -502,7 +599,7 @@ class WorkerFedOur(object):
                     loss, performance, output, feature = self._inference(data_batch)    # 前向传播
 
                 with self.timer("extra_forward_pass", epoch=self.scheduler.epoch_):
-                    loss = self.local_training_with_extra_calculate(loss, output, data_batch, feature=feature,target = _target, prototypes = prototypes)  # 计算L2损失
+                    loss = self.local_training_with_extra_calculate(loss, output, data_batch, feature=feature,target = _target, prototypes=prototypes)  # 计算L2损失
                 with self.timer("backward_pass", epoch=self.scheduler.epoch_):
                     self.optimizer.zero_grad()
                     loss.backward()

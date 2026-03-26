@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import copy
+import gc
 
 import numpy as np
 import torch
@@ -19,6 +20,10 @@ import torch.nn.utils as torch_utils
 from pcode.models.resnet import MetaBasicBlock
 from torch import nn
 import clip
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.manifold import TSNE
+import pcode.create_dataset as create_dataset # 确保引入了这个，用于加载 batch
 
 class MasterFedOur(object):
     def __init__(self, conf):
@@ -37,10 +42,10 @@ class MasterFedOur(object):
         # 恢复全局模型
 
         self.text_model, _ = self.load_clip_text_model()
-        self.anchor = self.generate_text_anchors()
-        self.output_dim = self.anchor[0].shape[-1] 
+        self.output_dim = self.text_model.text_projection.shape[1]
         conf.output_dim = self.output_dim
         self.conf = conf
+        self.prepare_text_embeddings()
 
         self.used_client_archs =[create_model.determine_arch(conf, client_id, use_complex_arch=True) for client_id in range(1, 1 + conf.n_clients)]  # 所有客户端模型架构名称
         
@@ -54,6 +59,9 @@ class MasterFedOur(object):
             create_model.define_model(conf, to_consistent_model=False, client_id=i, arch=arch)
             for i,arch in enumerate(self.used_client_archs)
         ]
+
+        for i in range(len(self.client_models)): # 给所有客户端注入可训练提示词
+            self._inject_learnable_prompt(self.client_models[i][1])
 
         # 拷贝构建全局模型
 
@@ -416,9 +424,85 @@ class MasterFedOur(object):
             # evaluate the aggregated model.
             self.conf.logger.log(f"Master finished one round of federated learning.\n")
 
+            if comm_round == self.conf.n_comm_rounds:
+            # if comm_round == 5:
+                self.visualize_global_features()
+            gc.collect()
+            torch.cuda.empty_cache()
         # formally stop the training (the master has finished all communication rounds).
         dist.barrier()
         self._finishing()
+
+    def visualize_global_features(self):
+        """
+        在最后一轮提取全局模型在测试集上的特征，并使用 t-SNE 绘制特征分布散点图。
+        """
+        self.conf.logger.log("Extracting features for t-SNE visualization...")
+        
+        # 1. 准备模型
+        self.master_model.eval()
+        if self.conf.graph.on_cuda:
+            self.master_model = self.master_model.cuda()
+
+        all_features = []
+        all_targets = []
+
+        # 2. 遍历测试集提取特征
+        with torch.no_grad():
+            # 假设 self.test_loaders 是一个列表，合并所有 loader 的特征
+            for data_loader in self.test_loaders:
+                for _input, _target in data_loader:
+                    data_batch = create_dataset.load_data_batch(
+                        self.conf, _input, _target, is_training=False
+                    )
+                    
+                    # 根据你 worker 的代码，模型的 forward 返回 feature 和 output
+                    # 如果你的 master_model 返回格式不同，请在这里相应修改
+                    feature, output = self.master_model(data_batch["input"])
+                    
+                    # 收集特征和标签
+                    all_features.append(feature.cpu().numpy())
+                    all_targets.append(data_batch["target"].cpu().numpy())
+
+        # 3. 拼接所有 Batch 的数据
+        all_features = np.concatenate(all_features, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+
+        self.conf.logger.log(f"Extracted features shape: {all_features.shape}, running t-SNE...")
+
+        # 4. 使用 t-SNE 降维到 2D
+        tsne = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto')
+        features_2d = tsne.fit_transform(all_features)
+
+        # 5. 绘制散点图
+        plt.figure(figsize=(10, 8))
+        num_classes = len(np.unique(all_targets))
+        
+        sns.scatterplot(
+            x=features_2d[:, 0], 
+            y=features_2d[:, 1],
+            hue=all_targets,
+            palette=sns.color_palette("tab10", num_classes) if num_classes <= 10 else sns.color_palette("husl", num_classes),
+            legend="full",
+            alpha=0.7,
+            s=20 # 点的大小
+        )
+        
+        plt.title(f"t-SNE visualization of Global Model Features (Round {self.conf.graph.comm_round})")
+        plt.xlabel("t-SNE Dimension 1")
+        plt.ylabel("t-SNE Dimension 2")
+        plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
+        plt.tight_layout()
+        
+        # 6. 保存图片到 checkpoint 目录
+        save_path = os.path.join(self.conf.checkpoint_root, "global_model_tsne_final_round.png")
+        plt.savefig(save_path, dpi=300)
+        plt.close()
+        
+        self.conf.logger.log(f"t-SNE feature visualization saved to {save_path}")
+        
+        if self.conf.graph.on_cuda:
+            self.master_model = self.master_model.cpu()
 
     def receive_extra_info_from_selected_clients(self, selected_client_ids):
         pass
@@ -507,66 +591,6 @@ class MasterFedOur(object):
         dist.barrier()
         self.conf.logger.log(f"Master received all local models.")
         return flatten_local_models
-
-    def _fedavg(self, flatten_local_models, weights=None):
-        n_selected_clients = len(flatten_local_models)
-
-        if weights == None:
-            weights = [
-                torch.FloatTensor([1.0 / n_selected_clients]) for _ in range(n_selected_clients)
-            ]
-
-        # NOTE: the arch for different local models needs to be the same as the master model.
-        # retrieve the local models.
-        local_models = {}
-        for client_idx, flatten_local_model in flatten_local_models.items():
-            _arch = self.clientid2arch[client_idx]
-            _model = copy.deepcopy(self.client_models[_arch])
-            _model_state_dict = self.client_models[_arch].state_dict()
-            flatten_local_model.unpack(_model_state_dict.values())
-            _model.load_state_dict(_model_state_dict)
-            local_models[client_idx] = _model
-
-        # uniformly average the local models.
-        # assume we use the runtime stat from the last model.
-        _model = copy.deepcopy(_model)
-        local_states = [
-            ModuleState(copy.deepcopy(local_model.state_dict()))
-            for _, local_model in local_models.items()
-        ]
-        model_state = local_states[0] * weights[0]
-        for idx in range(1, len(local_states)):
-            model_state += local_states[idx] * weights[idx]
-        model_state.copy_to_module(_model)
-        return _model
-
-    def _avg_over_archs(self, flatten_local_models):
-        # get unique arch from this comm. round.
-        archs = set(
-            [
-                self.clientid2arch[client_idx]
-                for client_idx in flatten_local_models.keys()
-            ]
-        )
-
-        # average for each arch.
-        archs_fedavg_models = {}
-        for arch in archs:
-            # extract local_models from flatten_local_models.
-            _flatten_local_models = {}
-            for client_idx, flatten_local_model in flatten_local_models.items():
-                if self.clientid2arch[client_idx] == arch:
-                    _flatten_local_models[client_idx] = flatten_local_model
-
-            # average corresponding local models.
-            self.conf.logger.log(
-                f"Master uniformly average over {len(_flatten_local_models)} received models ({arch})."
-            )
-
-            fedavg_model = self._fedavg(flatten_local_models) # 平均算法
-            archs_fedavg_models[arch] = fedavg_model
-        return archs_fedavg_models
-
 
     def aggregate(self, flatten_local_models, selected_client_ids):
         # uniformly average local models with the same architecture.
@@ -797,41 +821,120 @@ class MasterFedOur(object):
             # 将更新后的 state_dict 重新加载回模型（确保数据生效）
             target_model.load_state_dict(target_state_dict)
 
+    def get_dynamic_anchors(self):
+        """
+        每次迭代动态生成带有梯度的 Anchors。
+        流程: [SOS] + Learnable_Context + [Class_Name] + [EOS]
+        """
+        # 注意：这里一定不能用 torch.no_grad()，因为我们需要 prompt_ctx 的梯度！
+        self.text_model.eval() 
+        
+        batch_size = len(self.class_embedding)
+        n_ctx = self.master_model.prompt_ctx.shape[0]
 
 
+        device = self.class_embedding.device
+        prompt_ctx_casted = self.master_model.prompt_ctx.to(device = device, dtype = self.text_model.dtype)     
+        # 使用转换后的 prompt_ctx_casted 进行扩展
+        ctx = prompt_ctx_casted.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # CLIP Token 结构分离
+        # prefix: [SOS] token (索引 0)
+        # suffix: 类别名称 + [EOS] + 填充 (索引 1 开始)
+        prefix = self.class_embedding[:, :1, :] 
+        suffix = self.class_embedding[:, 1:, :] 
+        
+        # 拼接并在 77 处截断以符合 CLIP 的输入限制
+        x = torch.cat([prefix, ctx, suffix], dim=1)[:, :77, :]
+        
+        # 添加位置编码
+        x = x + self.text_model.positional_embedding.type(self.text_model.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        
+        layers = self.text_model.transformer.resblocks
+        total_layers = len(layers)
+        indices = [
+            int(total_layers * 1 / 4) - 1,
+            int(total_layers * 2 / 4) - 1,
+            int(total_layers * 3 / 4) - 1,
+            total_layers - 1
+        ]
+        
+        anchors_list = []
+        for i, layer in enumerate(layers):
+            x = layer(x)
+            if i in indices:
+                x_temp = x.permute(1, 0, 2)
+                
+                # 由于插入了 n_ctx 个 token，EOS 的位置向后移动了 n_ctx
+                eos_indices = self.tokenized_prompts.argmax(dim=-1) + n_ctx
+                eos_indices = torch.clamp(eos_indices, max=76) # 防止越界
+                
+                sent_emb = x_temp[torch.arange(x_temp.shape[0]), eos_indices]
+                
+                if i == total_layers - 1:
+                    sent_emb = self.text_model.ln_final(sent_emb).type(self.text_model.dtype)
+                    sent_emb = sent_emb @ self.text_model.text_projection
+                    
+                # sent_emb = sent_emb / sent_emb.norm(dim=-1, keepdim=True)
+                anchors_list.append(sent_emb.float())
+                
+        return anchors_list
+    def prepare_text_embeddings(self):
+        """为 Master 准备静态的类别文本 Embedding"""
+        dataset_name = self.conf.data.lower()
+        # 这里简写了，请把你的 classes 列表完整放进来
+        if dataset_name == "cifar10":
+            classes = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"]
+        elif dataset_name == "cifar100":
+            classes = ['apple', 'aquarium fish', 'baby', 'bear', 'beaver'] # 替换为完整的 cifar100
+        else:
+            raise ValueError("Dataset not supported.")
+            
+        prompts = [f"{c}" for c in classes]
+        device = next(self.text_model.parameters()).device
+        self.tokenized_prompts = clip.tokenize(prompts).to(device)
+        
+        self.text_model.eval()
+        with torch.no_grad():
+            self.class_embedding = self.text_model.token_embedding(self.tokenized_prompts).type(self.text_model.dtype)
     def _aggregate_model_and_evaluate(self, flatten_local_models, selected_client_ids):
         # aggregate the local models.
         self.selected_client_ids = selected_client_ids
+        
+        # 1. 正常计算本轮选中的客户端的平均模型
         aggregated_model = self.aggregate(
             flatten_local_models,
             selected_client_ids
-        ) # 计算平均后的模型
+        ) 
 
-        client_models = {0: aggregated_model}
-
-        self.master_model.load_state_dict(
-            list(client_models.values())[0].state_dict()
-
-
+        # ==================== [核心修改：EMA 迭代聚合逻辑] ====================
         
-        )
-                
-         # 更新全局模型
-        # for arch, _client_model in client_models.items():
-        #     self.client_models[arch].load_state_dict(_client_model.state_dict())
+        # 定义本轮新模型的更新步长 (beta)，范围通常在 0.1 ~ 0.4 之间
+        # 0.2 意味着：新全局模型 = 80% 上一轮老模型 + 20% 本轮新聚合模型
+        beta = 0.2  
+        
+        old_state_dict = self.master_model.state_dict()
+        new_state_dict = aggregated_model.state_dict()
 
-        # for arch, _client_model in client_models.items():
-        #     # arch 现在是 0
-        #     if arch in self.client_models:
-        #         target = self.client_models[arch]
-                
-        #         # 【修复重点】判断是否为元组，如果是，取第2个元素
-        #         if isinstance(target, tuple):
-        #             target[1].load_state_dict(_client_model.state_dict())
-        #         else:
-        #             target.load_state_dict(_client_model.state_dict())
+        # 只有在第 2 轮及以后才进行加权融合。
+        # 第一轮 (comm_round == 1) 必须 100% 接受新模型，否则会一直保留随机初始化的参数！
+        if self.conf.graph.comm_round > 1:
+            for key in old_state_dict:
+                # 只对浮点数参数（如 weights, biases, prompt_ctx）进行平滑加权
+                if old_state_dict[key].is_floating_point():
+                    new_state_dict[key] = (1.0 - beta) * old_state_dict[key] + beta * new_state_dict[key]
+                else:
+                    # 对于非浮点数（如 BatchNorm 的 num_batches_tracked），通常直接保留本轮的新值即可
+                    pass 
+                    
+        # 将融合后的平滑参数加载到全局模型中
+        self.master_model.load_state_dict(new_state_dict)
+        # =======================================================================
 
-        # evaluate the aggregated model on the test data.
+        # 为全局模型挂载文本锚点 (保持你原有的逻辑)
+        self.master_model.set_text_anchors(self.get_dynamic_anchors())  
+
         master_utils.do_validation( # 最终评估
             self.conf,
             self.coordinator,
@@ -842,16 +945,9 @@ class MasterFedOur(object):
             label=f"aggregated_test_loader_0",
         )
 
-        # self.conf.train_fast=False
-        
+        # ... 下面的 client 评估和 early stopping 等逻辑保持完全不变 ...
         if not self.conf.train_fast:  # test all the selected_clients
             for client_idx in selected_client_ids:
-                # _arch = self.clientid2arch[client_idx]
-                # _model_state_dict = copy.deepcopy(self.client_models[client_idx][1].state_dict())
-                # flatten_local_model.unpack(_model_state_dict.values())
-                # real_arch = _arch[1] if isinstance(_arch, tuple) else _arch
-                # _, test_model = create_model.define_model(self.conf, to_consistent_model=False, client_id=client_idx , arch=real_arch)
-                # test_model.load_state_dict(_model_state_dict)
                 test_model = copy.deepcopy(self.client_models[client_idx][1])
                 master_utils.do_validation(
                     conf=self.conf,
@@ -863,7 +959,6 @@ class MasterFedOur(object):
                     label=f"aggregated_test_loader_{client_idx}",
                 )
             self.additional_validation()
-
 
         torch.cuda.empty_cache()
     def additional_validation(self):
@@ -910,6 +1005,18 @@ class MasterFedOur(object):
         checkpoint.save_arguments(self.conf)
         os.system(f"echo {self.conf.checkpoint_root} >> {self.conf.job_id}")
 
+    def _inject_learnable_prompt(self, model):
+        """
+        为 Master 端的模型注入与 Worker 结构完全一致的可学习提示词参数，
+        以确保 state_dict 的键值和 TensorBuffer 的长度完全匹配。
+        """
+        n_ctx = 16  # 必须与你在 Worker 中设置的 n_ctx 长度完全一致！
+        ctx_dim = self.text_model.token_embedding.weight.shape[1] # 通常是 512
+        
+        # 将参数作为 nn.Parameter 挂载到模型上
+        # 因为 Master 刚初始化时模型通常在 CPU 上，所以这里不用 to(device)
+        model.prompt_ctx = nn.Parameter(torch.empty(n_ctx, ctx_dim))
+        nn.init.normal_(model.prompt_ctx, std=0.02)
 
 def get_n_local_epoch(conf, n_participated):
     if conf.min_local_epochs is None:

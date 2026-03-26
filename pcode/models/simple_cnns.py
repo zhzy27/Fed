@@ -280,7 +280,21 @@ class MetaCNN(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(512, 512)
                 )
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.text_anchors = None
 
+    def set_text_anchors(self, dynamic_anchors_list):
+        """设置文本锚点特征 (CLIP 生成的文本特征)"""
+        # 1. get_dynamic_anchors 返回的是包含 4 个特征的列表
+        #    用于最终分类计算 logits 的，是最后一层的特征 (索引为 -1)
+        final_anchor = dynamic_anchors_list[-1]
+
+        # 2. 确保它是 Tensor 后，再进行 L2 归一化 (防呆设计)
+        final_anchor = F.normalize(final_anchor, p=2, dim=-1)
+
+        # 3. 赋值给普通的实例属性，保留计算图
+        self.text_anchors = final_anchor
+    
     def forward(self, x):
         # Layer 1
         x = self.pool(F.relu(self.bn1(self.conv1(x))))
@@ -305,7 +319,20 @@ class MetaCNN(nn.Module):
         
         # Dropout & Classifier
         x = self.dropout(x)
-        logits = self.classifier(x)
+        # logits = self.classifier(x)
+        aligned_feature = self.clip_adapter(x) # 适配层对齐 CLIP 特征空间
+        aligned_feature = F.normalize(aligned_feature, p=2, dim=-1) # L2 归一化
+
+        if hasattr(self, 'text_anchors') and self.text_anchors is not None:
+            # 计算与文本锚点的相似度 (点积) 并应用温度缩放
+            # logits = self.logit_scale.exp() * aligned_feature @ self.text_anchors.T
+            current_device = aligned_feature.device
+            matched_anchors = self.text_anchors.to(current_device)
+            logit_scale = torch.clamp(self.logit_scale.exp(), max=100.0)
+            logits = logit_scale * aligned_feature @ matched_anchors.T
+        else:
+            print("Warning: Text anchors not set. Returning unscaled features as logits.")
+
 
         return x, logits
 
@@ -334,6 +361,7 @@ class MetaCNN(nn.Module):
             print(" -> fc1 decomposed.")
             
         self.rank_rate = rank_rate
+        # self._fix_module_order()
 
     def recover_model(self):
         """将 conv5 和 fc1 恢复为完整层"""
@@ -356,7 +384,7 @@ class MetaCNN(nn.Module):
             # 调用你提供的 Recover_LINEAR
             self.fc1 = Recover_LINEAR(self.fc1)
             print(" -> fc1 recovered.")
-            
+        # self._fix_module_order()
         # self.rank_rate = 1.0
 
     # === 正则化 Loss 计算 (用于低秩训练阶段) ===

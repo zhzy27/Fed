@@ -18,6 +18,10 @@ from pcode.utils.early_stopping import EarlyStoppingTracker
 import torch.nn.utils as torch_utils
 from pcode.models.resnet import MetaBasicBlock
 from torch import nn
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.manifold import TSNE
+import pcode.create_dataset as create_dataset # 确保引入了这个，用于加载 batch
 
 class MasterFedHM(object):
     def __init__(self, conf):
@@ -251,9 +255,86 @@ class MasterFedHM(object):
             # evaluate the aggregated model.
             self.conf.logger.log(f"Master finished one round of federated learning.\n")
 
+            if comm_round == self.conf.n_comm_rounds:
+            # if comm_round == 5:
+                self.visualize_global_features()
+
         # formally stop the training (the master has finished all communication rounds).
         dist.barrier()
         self._finishing()
+
+
+
+    def visualize_global_features(self):
+        """
+        在最后一轮提取全局模型在测试集上的特征，并使用 t-SNE 绘制特征分布散点图。
+        """
+        self.conf.logger.log("Extracting features for t-SNE visualization...")
+        
+        # 1. 准备模型
+        self.master_model.eval()
+        if self.conf.graph.on_cuda:
+            self.master_model = self.master_model.cuda()
+
+        all_features = []
+        all_targets = []
+
+        # 2. 遍历测试集提取特征
+        with torch.no_grad():
+            # 假设 self.test_loaders 是一个列表，合并所有 loader 的特征
+            for data_loader in self.test_loaders:
+                for _input, _target in data_loader:
+                    data_batch = create_dataset.load_data_batch(
+                        self.conf, _input, _target, is_training=False
+                    )
+                    
+                    # 根据你 worker 的代码，模型的 forward 返回 feature 和 output
+                    # 如果你的 master_model 返回格式不同，请在这里相应修改
+                    feature, output = self.master_model(data_batch["input"])
+                    
+                    # 收集特征和标签
+                    all_features.append(feature.cpu().numpy())
+                    all_targets.append(data_batch["target"].cpu().numpy())
+
+        # 3. 拼接所有 Batch 的数据
+        all_features = np.concatenate(all_features, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+
+        self.conf.logger.log(f"Extracted features shape: {all_features.shape}, running t-SNE...")
+
+        # 4. 使用 t-SNE 降维到 2D
+        tsne = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto')
+        features_2d = tsne.fit_transform(all_features)
+
+        # 5. 绘制散点图
+        plt.figure(figsize=(10, 8))
+        num_classes = len(np.unique(all_targets))
+        
+        sns.scatterplot(
+            x=features_2d[:, 0], 
+            y=features_2d[:, 1],
+            hue=all_targets,
+            palette=sns.color_palette("tab10", num_classes) if num_classes <= 10 else sns.color_palette("husl", num_classes),
+            legend="full",
+            alpha=0.7,
+            s=20 # 点的大小
+        )
+        
+        plt.title(f"t-SNE visualization of Global Model Features (Round {self.conf.graph.comm_round})")
+        plt.xlabel("t-SNE Dimension 1")
+        plt.ylabel("t-SNE Dimension 2")
+        plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
+        plt.tight_layout()
+        
+        # 6. 保存图片到 checkpoint 目录
+        save_path = os.path.join(self.conf.checkpoint_root, "global_model_tsne_final_round.png")
+        plt.savefig(save_path, dpi=300)
+        plt.close()
+        
+        self.conf.logger.log(f"t-SNE feature visualization saved to {save_path}")
+        
+        if self.conf.graph.on_cuda:
+            self.master_model = self.master_model.cpu()
 
     def receive_extra_info_from_selected_clients(self, selected_client_ids):
         pass
