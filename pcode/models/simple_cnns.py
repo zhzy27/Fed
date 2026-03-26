@@ -399,6 +399,172 @@ class MetaCNN(nn.Module):
         return loss
 
 
+class HMMetaCNN(nn.Module):
+    def __init__(self, dataset, w_conv_bias=False, w_fc_bias=True, rank_rate=1.0):
+        super(HMMetaCNN, self).__init__()
+        
+        self.num_classes = _decide_num_classes(dataset)
+        self.rank_rate = rank_rate # 秩率
+        self.w_conv_bias = w_conv_bias # 记录配置以便恢复时使用
+        self.w_fc_bias = w_fc_bias
+        self.meta = True
+
+        # BN层通常不需要卷积偏置
+        use_conv_bias = False 
+
+        # === 前4层卷积 (保持固定，不进行分解) ===
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1, bias=use_conv_bias)
+        self.bn1 = nn.GroupNorm(16, 32)
+        # self.bn1 = nn.BatchNorm2d(32)
+        
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=use_conv_bias)
+        self.bn2 = nn.GroupNorm(16, 64)
+        # self.bn2 = nn.BatchNorm2d(64)
+
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=use_conv_bias)
+        self.bn3 = nn.GroupNorm(16, 128)
+        # self.bn3 = nn.BatchNorm2d(128)
+
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=use_conv_bias)
+        self.bn4 = nn.GroupNorm(16, 256)
+        # self.bn4 = nn.BatchNorm2d(256)
+
+        # === 第5层卷积 (可分解目标) ===
+        # 输入: 256, 输出: 256
+        if rank_rate >= 1.0:
+            self.conv5 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=use_conv_bias)
+        else:
+            self.conv5 = FactorizedConv(in_channels=256, out_channels=256, 
+                                        rank_rate=rank_rate, kernel_size=3, 
+                                        padding=1, stride=1, bias=use_conv_bias)
+        
+        self.bn5 = nn.GroupNorm(16, 256)
+        # self.bn5 = nn.BatchNorm2d(256)
+
+        # 池化与Dropout
+        self.pool = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout(p=0.5)
+
+        # 计算Flatten后的维度: 256 * 4 * 4 = 4096
+        self.flat_dim = 256 * 4 * 4
+        
+        # === FC1 层 (可分解目标) ===
+        # 输入: 4096, 输出: 512
+        if rank_rate >= 1.0:
+            self.fc1 = nn.Linear(self.flat_dim, 512, bias=w_fc_bias)
+        else:
+            self.fc1 = FactorizedLinear(in_features=self.flat_dim, out_features=512, 
+                                        rank_rate=rank_rate, bias=w_fc_bias)
+
+        self.classifier = nn.Linear(512, self.num_classes, bias=w_fc_bias)
+
+        # [ADD] 新增全局共享、可训练的 CLIP 适配层
+        # 输入是 fc1 输出的 512 维特征，输出是对齐 CLIP 的 512 维特征
+
+
+
+    def forward(self, x):
+        # Layer 1
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        # Layer 2 (No pool)
+        x = F.relu(self.bn2(self.conv2(x)))
+        # Layer 3
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        # Layer 4 (No pool)
+        x = F.relu(self.bn4(self.conv4(x)))
+        
+        # === Layer 5 (可能已分解) ===
+        # 注意: FactorizedConv 的 forward 已经处理了卷积逻辑
+        x = self.conv5(x) 
+        x = self.pool(F.relu(self.bn5(x)))
+
+        # Flatten
+        x = x.view(-1, self.flat_dim)
+
+        # === FC1 (可能已分解) ===
+        x = self.fc1(x)
+        x = F.relu(x)
+        
+        # Dropout & Classifier
+        x = self.dropout(x)
+        logits = self.classifier(x)
+
+        return x, logits
+
+    # === 模型分解与恢复方法 ===
+
+    def decom_model(self, rank_rate):
+        """将 conv5 和 fc1 分解为低秩层"""
+
+        self.meta = True
+
+        if rank_rate >= 1.0:
+            return
+        
+        print(f"Executing Decomposition (rank_rate={rank_rate})...")
+        
+        # 分解 Conv5
+        if isinstance(self.conv5, nn.Conv2d):
+            # 调用你提供的 Decom_COV
+            self.conv5 = Decom_COV(self.conv5, rank_rate)
+            print(" -> conv5 decomposed.")
+
+        # 分解 FC1
+        if isinstance(self.fc1, nn.Linear):
+            # 调用你提供的 Decom_LINEAR
+            self.fc1 = Decom_LINEAR(self.fc1, rank_rate)
+            print(" -> fc1 decomposed.")
+            
+        self.rank_rate = rank_rate
+
+    def recover_model(self):
+        """将 conv5 和 fc1 恢复为完整层"""
+
+        self.meta = False
+
+        if self.rank_rate >= 1.0:
+            return
+
+        print("Executing Recovery to Full Rank...")
+
+        # 恢复 Conv5
+        if isinstance(self.conv5, FactorizedConv):
+            # 调用你提供的 Recover_COV
+            self.conv5 = Recover_COV(self.conv5)
+            print(" -> conv5 recovered.")
+
+        # 恢复 FC1
+        if isinstance(self.fc1, FactorizedLinear):
+            # 调用你提供的 Recover_LINEAR
+            self.fc1 = Recover_LINEAR(self.fc1)
+            print(" -> fc1 recovered.")
+            
+        # self.rank_rate = 1.0
+
+    # === 正则化 Loss 计算 (用于低秩训练阶段) ===
+    
+    def L2_decay(self, type='frobenius'):
+        """计算分解层的正则化损失"""
+        loss = torch.tensor(0.0, device=self.conv1.weight.device)
+        
+        if self.rank_rate >= 1.0:
+            return loss
+
+        # 获取 Conv5 的 loss
+        if isinstance(self.conv5, FactorizedConv):
+            if type == 'frobenius': loss += self.conv5.frobenius_loss()
+            elif type == 'kronecker': loss += self.conv5.kronecker_loss()
+            elif type == 'l2': loss += self.conv5.L2_loss()
+
+        # 获取 FC1 的 loss
+        if isinstance(self.fc1, FactorizedLinear):
+            if type == 'frobenius': loss += self.fc1.frobenius_loss()
+            elif type == 'kronecker': loss += self.fc1.kronecker_loss()
+            elif type == 'l2': loss += self.fc1.L2_loss()
+            
+        return loss
+
+
         
 
 def simple_cnn(conf):
@@ -409,7 +575,12 @@ def simple_cnn(conf):
 
     if "cifar" in dataset or dataset == "svhn":
         if conf.meta: # 如果分解
-            return MetaCNN(dataset, w_conv_bias=conf.w_conv_bias, w_fc_bias=conf.w_fc_bias, rank_rate =rank_rate )
+            if conf.method == "fedour":
+                return MetaCNN(dataset, w_conv_bias=conf.w_conv_bias, w_fc_bias=conf.w_fc_bias, rank_rate =rank_rate )
+            elif conf.method == "fedhm":
+                return HMMetaCNN(dataset, w_conv_bias=conf.w_conv_bias, w_fc_bias=conf.w_fc_bias, rank_rate =rank_rate )
+            else:
+                assert(0 == 1)
         # return CNNCifar(dataset, w_conv_bias=conf.w_conv_bias, w_fc_bias=conf.w_fc_bias)
         return CNNCifar5Layer(dataset, w_conv_bias=conf.w_conv_bias, w_fc_bias=conf.w_fc_bias)
 
